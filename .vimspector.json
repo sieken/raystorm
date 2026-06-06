@@ -1,0 +1,66 @@
+{
+  "configurations": {
+    "Raystorm (gdb)": {
+      "adapter": "vscode-cpptools",
+      "configuration": {
+        "request": "launch",
+        "program": "${workspaceRoot}/build/raystorm",
+        "cwd": "${workspaceRoot}/runtime",
+        "args": [],
+        "environment": [],
+        "externalConsole": false,
+        "stopAtEntry": false,
+        "MIMode": "gdb",
+        "miDebuggerPath": "/usr/bin/gdb",
+        "setupCommands": [
+          {
+            "description": "Disable debuginfod prompts for project debugging",
+            "text": "set debuginfod enabled off",
+            "ignoreFailures": true
+          },
+          {
+            "description": "Enable pending breakpoints",
+            "text": "set breakpoint pending on",
+            "ignoreFailures": true
+          },
+          {
+            "description": "Use readable STL and struct formatting",
+            "text": "set print pretty on",
+            "ignoreFailures": true
+          }
+        ]
+      }
+    },
+    "Raystorm (gdb, stop at entry)": {
+      "adapter": "vscode-cpptools",
+      "configuration": {
+        "request": "launch",
+        "program": "${workspaceRoot}/build/raystorm",
+        "cwd": "${workspaceRoot}/runtime",
+        "args": [],
+        "environment": [],
+        "externalConsole": false,
+        "stopAtEntry": true,
+        "MIMode": "gdb",
+        "miDebuggerPath": "/usr/bin/gdb",
+        "setupCommands": [
+          {
+            "description": "Disable debuginfod prompts for project debugging",
+            "text": "set debuginfod enabled off",
+            "ignoreFailures": true
+          },
+          {
+            "description": "Enable pending breakpoints",
+            "text": "set breakpoint pending on",
+            "ignoreFailures": true
+          },
+          {
+            "description": "Use readable STL and struct formatting",
+            "text": "set print pretty on",
+            "ignoreFailures": true
+          }
+        ]
+      }
+    }
+  }
+}

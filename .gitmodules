@@ -1,0 +1,3 @@
+[submodule "myrlib"]
+	path = myrlib
+	url = git@github.com:sieken/myrlib.git
