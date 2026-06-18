@@ -1,12 +1,14 @@
 #ifndef _GAME_H
 
-#include <myr_math.h>
-
 #if DEBUG
 #define ASSERT(expression) if (!(expression)) { *(int*)0 = 0; }
 #else
 #define ASSERT(expression)
 #endif
+
+#include <myr.h>
+#include <myr_math.h>
+#include <myr_arena.h>
 
 enum OrbType {
     ORB_NONE = 0,
@@ -29,42 +31,19 @@ static inline Color get_orb_render_color(OrbType o) {
     }
 }
 
-enum OrbFlag {
-    ORB_JUST_DROPPED = (1U << 0),
-    ORB_MOVING       = (1U << 1),
-};
+typedef u32 OrbId;
+#define ORB_ID_NONE 0
 
 struct Orb {
-    u64 flags;
     OrbType type;
+    OrbId id;
 };
 
-static inline b32 orb_has_flags(Orb *o, u64 flags) {
-    ASSERT(o && flags); // Treat 0 flag as invalid
-    return (o->flags & flags) == flags;
-}
-
-#define ORB_CLEAR_FLAGS(optr, f) ((optr)->flags &= ~((u64) (f)))
-
-struct GridOrb {
+struct BoardCell {
     Orb orb;
-
-    bool marked;
-    u32  move_from_row;
-
-    // Board neighbors
-    union {
-        struct {
-            GridOrb *neighbor_up;
-            GridOrb *neighbor_right;
-            GridOrb *neighbor_down;
-            GridOrb *neighbor_left;
-        };
-        GridOrb* neighbor[4];
-    };
 };
 
-// NOTE: These need to match the order of neighbor links
+// NOTE: These values are used as direction indices in board traversal.
 enum StackDirection {
     STACKDIR_UP = 0,
     STACKDIR_RIGHT,
@@ -90,82 +69,91 @@ static inline StackDirection opposite_dir(StackDirection dir) {
 #define PLAYERFIELD_ROWS 14
 #define PLAYER_HOLD_SIZE PLAYERFIELD_ROWS / 2
 #define TOTAL_BOARD_SIZE PLAYERFIELD_ROWS * PLAYERFIELD_COLS
+
+struct HeldStack {
+    Orb orbs[PLAYER_HOLD_SIZE];
+    u32 count;
+    OrbType type;
+};
+
+enum BoardEventType {
+    BOARDEVENT_ORB_MOVED,
+    BOARDEVENT_ORB_REMOVED,
+    BOARDEVENT_ORB_HELD,
+    BOARDEVENT_ORB_RELEASED,
+};
+
+struct BoardEvent {
+    BoardEventType type;
+    Orb orb;
+    u32 from_col;
+    u32 from_row;
+    u32 to_col;
+    u32 to_row;
+};
+
+#define MAX_BOARD_EVENTS 256
+struct BoardEventBuffer {
+    BoardEvent events[MAX_BOARD_EVENTS];
+    u32 count;
+};
+
+struct BoardResolveScratch {
+    bool just_dropped[TOTAL_BOARD_SIZE];
+    bool to_remove[TOTAL_BOARD_SIZE];
+    bool visited[TOTAL_BOARD_SIZE];
+};
+
+#define ORB_MOVE_DURATION    0.15f
+#define ORB_REMOVE_DURATION  0.12f
+
+enum OrbVisualState {
+    ORBVISUAL_IDLE,
+    ORBVISUAL_MOVING,
+    ORBVISUAL_REMOVING,
+    ORBVISUAL_HELD,
+};
+
+struct OrbVisual {
+    b32 active;
+
+    OrbId id;
+    OrbType type;
+    OrbVisualState state;
+
+    v2 from_pos;
+    v2 to_pos;
+    v2 pos;
+
+    f32 t;
+    f32 duration;
+};
+
+// Should account for max orbs in field + held in hand
+#define MAX_PLAYER_ORBS 128 
+struct PlayerVisualState {
+    OrbVisual visuals[MAX_PLAYER_ORBS];
+};
+
 struct PlayerState {
     u32 at_col;
 
-    u32     hold_count;
-    OrbType hold_type;
-    Orb     hold[PLAYER_HOLD_SIZE];
+    HeldStack hold;
 
-    GridOrb board[TOTAL_BOARD_SIZE];
+    BoardCell board[TOTAL_BOARD_SIZE];
+    OrbId next_orb_id;
+
+    PlayerVisualState visual_state;
 };
 
-static inline u32 board_get_index(u32 x, u32 y) {
-    ASSERT(x < PLAYERFIELD_COLS && y < PLAYERFIELD_ROWS);
-    return y * PLAYERFIELD_COLS + x;
-}
-
 struct StackView {
-    GridOrb *start;
-    GridOrb *top;
+    PlayerState *player;
+    u32 col;
+    i32 top_row;
     StackDirection dir;
     u32 count;
     u32 max;
 };
-
-static inline StackView make_stack_view(GridOrb *start, StackDirection dir, u32 max = PLAYERFIELD_ROWS) {
-    StackView result = {};
-
-    GridOrb *prev = 0;
-    GridOrb *o    = start;
-
-    // Build stack info
-    u32 count = 0;
-    while (o && o->orb.type > ORB_NONE && count < max) {
-        prev = o;
-        o    = o->neighbor[dir];
-        count++;
-    }
-
-    result.start = start;
-    result.top = prev;
-    result.count = count;
-    result.max = max;
-    result.dir = dir;
-
-    return result;
-}
-
-static inline Orb stack_view_pop(StackView *s) {
-    ASSERT(s->count > 0 && s->top);
-
-    GridOrb result = *s->top;
-    s->top = s->top->neighbor[opposite_dir(s->dir)];
-    s->count--;
-    return result.orb;
-}
-
-static inline Orb stack_view_pop_commit(StackView *s) {
-    ASSERT(s->count > 0 && s->top);
-
-    Orb result = s->top->orb;
-    s->top->orb = {};
-    s->top = s->top->neighbor[opposite_dir(s->dir)];
-    s->count--;
-    return result;
-}
-
-static inline void stack_view_push_commit(StackView *s, Orb orb) {
-    ASSERT(s->count < s->max);
-
-    GridOrb *dst = s->top ? s->top->neighbor[s->dir] : s->start;
-    ASSERT(dst);
-
-    dst->orb = orb;
-    s->top = dst;
-
-    s->count++;
-}
 
 enum GameControllerInput {
     GAMEINPUT_NONE        = (1U << 0),

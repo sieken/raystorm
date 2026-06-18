@@ -28,98 +28,309 @@ static inline Vector2 make_vector2(v2 v) {
     return (Vector2){ v.x, v.y };
 }
 
-static void attempt_to_pull_stack(PlayerState *p) {
+static inline f32 clamp01(f32 value) {
+    if (value < 0.f) return 0.f;
+    if (value > 1.f) return 1.f;
+    return value;
+}
+
+static inline v2 lerp_v2(v2 a, v2 b, f32 t) {
+    return a + ((b - a) * t);
+}
+
+struct PlayerFieldLayout {
+    v2 field_tl;
+    v2 field_wh;
+    v2 cell_wh;
+    v2 gutter_wh;
+    v2 orb_pad;
+    v2 orb_dim;
+};
+
+struct GameRenderLayout {
+    v2 inner_tl;
+    v2 inner_wh;
+    v2 pf_gap;
+    PlayerFieldLayout player_1;
+    PlayerFieldLayout player_2;
+};
+
+#define LAYOUT_INNER_W       ((f32) TARGET_WIDTH * 0.5f)
+#define LAYOUT_INNER_H       ((f32) TARGET_HEIGHT * 0.9f)
+#define LAYOUT_INNER_X       (((f32) TARGET_WIDTH - LAYOUT_INNER_W) * 0.5f)
+#define LAYOUT_INNER_Y       (((f32) TARGET_HEIGHT - LAYOUT_INNER_H) * 0.5f)
+#define LAYOUT_PF_GAP        (LAYOUT_INNER_W * 0.1f)
+#define LAYOUT_PF_BOT        40.f
+#define LAYOUT_PF_W          ((LAYOUT_INNER_W - LAYOUT_PF_GAP) * 0.5f)
+#define LAYOUT_PF_H          (LAYOUT_INNER_H - LAYOUT_PF_BOT)
+#define LAYOUT_CELL_WH       (LAYOUT_PF_W / (f32) PLAYERFIELD_COLS)
+#define LAYOUT_GUTTER_H      (LAYOUT_PF_H - (LAYOUT_CELL_WH * (f32) PLAYERFIELD_ROWS))
+#define LAYOUT_ORB_PAD       4.f
+#define LAYOUT_ORB_DIM       (LAYOUT_CELL_WH - (LAYOUT_ORB_PAD * 2.f))
+#define LAYOUT_P2_X          (LAYOUT_INNER_X + LAYOUT_PF_GAP + LAYOUT_PF_W)
+
+static const GameRenderLayout GAME_RENDER_LAYOUT = {
+    { LAYOUT_INNER_X, LAYOUT_INNER_Y },
+    { LAYOUT_INNER_W, LAYOUT_INNER_H },
+    { LAYOUT_PF_GAP, 0.f },
+    {
+        { LAYOUT_INNER_X, LAYOUT_INNER_Y },
+        { LAYOUT_PF_W, LAYOUT_PF_H },
+        { LAYOUT_CELL_WH, LAYOUT_CELL_WH },
+        { LAYOUT_PF_W, LAYOUT_GUTTER_H },
+        { LAYOUT_ORB_PAD, LAYOUT_ORB_PAD },
+        { LAYOUT_ORB_DIM, LAYOUT_ORB_DIM },
+    },
+    {
+        { LAYOUT_P2_X, LAYOUT_INNER_Y },
+        { LAYOUT_PF_W, LAYOUT_PF_H },
+        { LAYOUT_CELL_WH, LAYOUT_CELL_WH },
+        { LAYOUT_PF_W, LAYOUT_GUTTER_H },
+        { LAYOUT_ORB_PAD, LAYOUT_ORB_PAD },
+        { LAYOUT_ORB_DIM, LAYOUT_ORB_DIM },
+    },
+};
+
+static inline v2 board_cell_to_screen(const PlayerFieldLayout *layout, u32 col, u32 row) {
+    ASSERT(layout);
+    ASSERT(col < PLAYERFIELD_COLS);
+    ASSERT(row < PLAYERFIELD_ROWS);
+
+    v2 grid_pos = hadamard(make_v2(col, row), layout->cell_wh);
+    return layout->field_tl + grid_pos + layout->orb_pad;
+}
+
+// ---
+// board state helpers
+// ---
+
+static inline u32 board_get_index(u32 x, u32 y) {
+    ASSERT(x < PLAYERFIELD_COLS && y < PLAYERFIELD_ROWS);
+    return y * PLAYERFIELD_COLS + x;
+}
+
+static inline b32 board_in_bounds(i32 x, i32 y) {
+    return x >= 0 && x < PLAYERFIELD_COLS && y >= 0 && y < PLAYERFIELD_ROWS;
+}
+
+static inline BoardCell *board_get_cell(PlayerState *p, u32 x, u32 y) {
+    return &p->board[board_get_index(x, y)];
+}
+
+static inline b32 orb_exists(Orb orb) {
+    return orb.type > ORB_NONE;
+}
+
+static inline Orb make_orb(PlayerState *p, OrbType type) {
+    Orb result = {};
+    result.type = type;
+    result.id = p->next_orb_id++;
+    if (result.id == ORB_ID_NONE) result.id = p->next_orb_id++;
+    return result;
+}
+
+static void push_board_event(BoardEventBuffer *events, BoardEvent event) {
+    if (!events) return;
+    ASSERT(events->count < MAX_BOARD_EVENTS);
+    events->events[events->count++] = event;
+}
+
+static inline StackView make_stack_view(PlayerState *p, u32 col, StackDirection dir, u32 max = PLAYERFIELD_ROWS) {
+    ASSERT(dir == STACKDIR_DOWN); // For now, however possibly can use this to make stacks in any direction
+    ASSERT(col < PLAYERFIELD_COLS);
+
+    StackView result = {};
+
+    u32 count = 0;
+    while (count < max && count < PLAYERFIELD_ROWS) {
+        BoardCell *cell = board_get_cell(p, col, count);
+        if (!orb_exists(cell->orb)) break;
+        count++;
+    }
+
+    result.player = p;
+    result.col = col;
+    result.top_row = count > 0 ? (i32) count - 1 : -1;
+    result.count = count;
+    result.max = max;
+    result.dir = dir;
+
+    return result;
+}
+
+static inline Orb stack_view_pop(StackView *s) {
+    ASSERT(s->count > 0 && s->top_row >= 0);
+
+    BoardCell *cell = board_get_cell(s->player, s->col, (u32) s->top_row);
+    Orb result = cell->orb;
+    s->top_row--;
+    s->count--;
+    return result;
+}
+
+static inline Orb stack_view_pop_commit(StackView *s) {
+    ASSERT(s->count > 0 && s->top_row >= 0);
+
+    BoardCell *cell = board_get_cell(s->player, s->col, (u32) s->top_row);
+    Orb result = cell->orb;
+    cell->orb = {};
+    s->top_row--;
+    s->count--;
+    return result;
+}
+
+static inline u32 stack_view_push_commit(StackView *s, Orb orb) {
+    ASSERT(s->count < s->max);
+
+    u32 dst_row = s->count;
+    BoardCell *dst = board_get_cell(s->player, s->col, dst_row);
+    ASSERT(!orb_exists(dst->orb));
+
+    dst->orb = orb;
+    s->top_row = (i32) dst_row;
+
+    s->count++;
+    return dst_row;
+}
+
+static void attempt_to_pull_stack(PlayerState *p, BoardEventBuffer *events) {
     ASSERT(p->at_col < PLAYERFIELD_COLS);
 
-    // Stackview for the settled column, from the visual top down.
-    StackView s = make_stack_view(&p->board[board_get_index(p->at_col, 0)], STACKDIR_DOWN);
+    // Stackview for the settled column, from the visual top down
+    StackView s = make_stack_view(p, p->at_col, STACKDIR_DOWN);
     if (s.count < 1) return; // Nothing to pull
 
     OrbType ref;
-    if (p->hold_count > 0) ref = p->hold_type;
-    else                   ref = s.top->orb.type;
+    if (p->hold.count > 0) ref = p->hold.type;
+    else                   ref = board_get_cell(p, p->at_col, (u32) s.top_row)->orb.type;
 
     // Count how many to pull
     u32 pull_count = 0;
     StackView copy = s;
-    while (copy.top && copy.top->orb.type == ref) {
+    while (copy.top_row >= 0 && board_get_cell(p, p->at_col, (u32) copy.top_row)->orb.type == ref) {
         stack_view_pop(&copy);
         pull_count++;
     }
 
     // If we can fit the stack...
-    if (p->hold_count + pull_count < PLAYER_HOLD_SIZE) {
+    if (p->hold.count + pull_count < PLAYER_HOLD_SIZE) {
         // ... We pull the stack
-        p->hold_type = ref;
+        p->hold.type = ref;
         for (u32 i = 0; i < pull_count; ++i) {
+            u32 from_row = (u32) s.top_row;
             Orb o = stack_view_pop_commit(&s);
-            p->hold[p->hold_count++] = o;
+            p->hold.orbs[p->hold.count++] = o;
+
+            BoardEvent event = {};
+            event.type = BOARDEVENT_ORB_HELD;
+            event.orb = o;
+            event.from_col = p->at_col;
+            event.from_row = from_row;
+            event.to_col = p->at_col;
+            event.to_row = PLAYERFIELD_ROWS;
+            push_board_event(events, event);
         }
     }
 }
 
-static void mark_matching_recursive_depth_first(GridOrb *gorb, OrbType type, StackDirection from_dir) {
+static void mark_matching_recursive_depth_first(PlayerState *p, BoardResolveScratch *scratch, u32 col, u32 row, OrbType type, StackDirection from_dir) {
     // NULL or empty, or incorrect type should stop recursion
-    if (!gorb || gorb->orb.type == ORB_NONE || gorb->orb.type != type) return;
+    if (!board_in_bounds((i32) col, (i32) row)) return;
 
-    // Do not visit already marked gorbs, otherwise we may end up with infinite recursion loops
-    if (gorb->marked) return;
+    u32 index = board_get_index(col, row);
+    BoardCell *cell = &p->board[index];
+    if (cell->orb.type == ORB_NONE || cell->orb.type != type) return;
 
-    gorb->marked = true;
+    // Do not visit already checked cells, otherwise recursion can loop through connected regions.
+    if (scratch->visited[index]) return;
 
-    // Recurse over all neighbors except originator
+    scratch->visited[index] = true;
+    scratch->to_remove[index] = true;
+
+    // Recurse over all adjacent cells except the origin direction.
     for (u32 i = 0; i < STACKDIR_INVALID; ++i) {
         if (i == from_dir) continue;
-        mark_matching_recursive_depth_first(gorb->neighbor[i], type, opposite_dir((StackDirection) i));
+
+        i32 next_col = (i32) col;
+        i32 next_row = (i32) row;
+        switch ((StackDirection) i) {
+            case STACKDIR_UP:    next_row--; break;
+            case STACKDIR_RIGHT: next_col++; break;
+            case STACKDIR_DOWN:  next_row++; break;
+            case STACKDIR_LEFT:  next_col--; break;
+            default: break;
+        }
+
+        if (!board_in_bounds(next_col, next_row)) continue;
+        mark_matching_recursive_depth_first(p, scratch, (u32) next_col, (u32) next_row, type, opposite_dir((StackDirection) i));
     }
 }
 
-static inline bool should_trigger_chain(GridOrb *gorb) {
-    if (!gorb || gorb->orb.type == ORB_NONE) return false;
+static inline bool should_trigger_chain(PlayerState *p, BoardResolveScratch *scratch, u32 col, u32 row) {
+    BoardCell *cell = board_get_cell(p, col, row);
+    if (cell->orb.type == ORB_NONE) return false;
 
-    // Just check if any neighbor matches this color
+    // Check neighbors
     for (u32 i = 0; i < STACKDIR_INVALID; ++i) {
-        GridOrb *n = gorb->neighbor[i];
-        if (n && !orb_has_flags(&n->orb, ORB_JUST_DROPPED) && n->orb.type == gorb->orb.type) return true;
+        i32 next_col = (i32) col;
+        i32 next_row = (i32) row;
+        switch ((StackDirection) i) {
+            case STACKDIR_UP:    next_row--; break;
+            case STACKDIR_RIGHT: next_col++; break;
+            case STACKDIR_DOWN:  next_row++; break;
+            case STACKDIR_LEFT:  next_col--; break;
+            default: break;
+        }
+
+        if (!board_in_bounds(next_col, next_row)) continue;
+
+        u32 neighbor_index = board_get_index((u32) next_col, (u32) next_row);
+        BoardCell *neighbor = &p->board[neighbor_index];
+
+        // Should trigger a chain reaction if neighbor wasn't placed just now, and it is of mathing type
+        if (!scratch->just_dropped[neighbor_index] && neighbor->orb.type == cell->orb.type) return true;
     }
 
     return false;
 }
 
-static void attempt_to_push_stack(PlayerState *p) {
+static void attempt_to_push_stack(PlayerState *p, BoardResolveScratch *scratch, BoardEventBuffer *events) {
     ASSERT(p->at_col < PLAYERFIELD_COLS);
-    if (p->hold_count < 1 || p->hold_type == ORB_NONE) return; // Nothing to push
+    if (p->hold.count < 1 || p->hold.type == ORB_NONE) return; // Nothing to push
 
-    // Stackview for the settled column, from the visual top down.
-    StackView s = make_stack_view(&p->board[board_get_index(p->at_col, 0)], STACKDIR_DOWN);
-    if (s.count + p->hold_count > PLAYERFIELD_ROWS) return; // Can't exceed column stack max size
+    // Stackview for the settled column, from the visual top down
+    StackView s = make_stack_view(p, p->at_col, STACKDIR_DOWN);
+    if (s.count + p->hold.count > PLAYERFIELD_ROWS) return; // Can't exceed column stack max size
 
-    OrbType ref = p->hold_type;
+    OrbType ref = p->hold.type;
 
     bool trigger_chain = false;
-    while (p->hold_count > 0) {
-        Orb o = p->hold[--p->hold_count];
-        stack_view_push_commit(&s, o);
-        s.top->orb.flags |= ORB_JUST_DROPPED;
-        if (!trigger_chain) trigger_chain = should_trigger_chain(s.top);
+    u32 last_row = 0;
+    while (p->hold.count > 0) {
+        Orb o = p->hold.orbs[--p->hold.count];
+        u32 dst_row = stack_view_push_commit(&s, o);
+        last_row = dst_row;
+
+        scratch->just_dropped[board_get_index(p->at_col, dst_row)] = true;
+        if (!trigger_chain) trigger_chain = should_trigger_chain(p, scratch, p->at_col, dst_row);
+
+        BoardEvent event = {};
+        event.type = BOARDEVENT_ORB_RELEASED;
+        event.orb = o;
+        event.from_col = p->at_col;
+        event.from_row = PLAYERFIELD_ROWS;
+        event.to_col = p->at_col;
+        event.to_row = dst_row;
+        push_board_event(events, event);
     }
-    p->hold_type = ORB_NONE;
+    p->hold.type = ORB_NONE;
 
     if (trigger_chain) {
-        // Come at the nodes from the top (i.e. below), meaning
+        // Come at the nodes from the stack top (i.e. visually below), meaning
         // that the initial one should ignore going down
         StackDirection initial_from_dir = STACKDIR_DOWN;
-        mark_matching_recursive_depth_first(s.top, ref, initial_from_dir);
+        mark_matching_recursive_depth_first(p, scratch, p->at_col, last_row, ref, initial_from_dir);
     }
-}
-
-
-static inline void clear_player_state(PlayerState *p) {
-    // Clear everything
-    memset(p, 0, sizeof(PlayerState));
-
-    // Set initial position to be middle col
-    p->at_col = (u8) PLAYERFIELD_COLS / 2;
 }
 
 static inline OrbType random_orb(void)  {
@@ -129,45 +340,34 @@ static inline OrbType random_orb(void)  {
 static inline void populate_random_rows(PlayerState *p, u32 rows) {
     for (u32 row = 0; row < rows; ++row) {
         for (u32 col = 0; col < PLAYERFIELD_COLS; ++col) {
-            GridOrb *orb  = &p->board[board_get_index(col, row)];
-            orb->orb.type = random_orb();
+            BoardCell *cell = board_get_cell(p, col, row);
+            cell->orb = make_orb(p, random_orb());
         }
     }
 }
 
-static inline void build_board_links(PlayerState *p) {
-    for (u32 row = 0; row < PLAYERFIELD_ROWS; ++row) {
-        for (u32 col = 0; col < PLAYERFIELD_COLS; ++col) {
-            GridOrb *o = &p->board[board_get_index(col, row)];
-
-            o->neighbor_up   = (row > 0) ? &p->board[board_get_index(col, row - 1)] : 0;
-            o->neighbor_left = (col > 0) ? &p->board[board_get_index(col - 1, row)] : 0;
-            o->neighbor_right = (col + 1 < PLAYERFIELD_COLS) ? &p->board[board_get_index(col + 1, row)] : 0;
-            o->neighbor_down  = (row + 1 < PLAYERFIELD_ROWS) ? &p->board[board_get_index(col, row + 1)] : 0;
-        }
-    }
-}
-
-static void apply_board_gravity(PlayerState *p) {
+static void apply_board_gravity(PlayerState *p, BoardEventBuffer *events) {
     for (u32 col = 0; col < PLAYERFIELD_COLS; ++col) {
         u32 write_row = 0;
 
         for (u32 read_row = 0; read_row < PLAYERFIELD_ROWS; ++read_row) {
-            GridOrb *src = &p->board[board_get_index(col, read_row)];
-            if (src->orb.type == ORB_NONE) continue;
+            BoardCell *src = board_get_cell(p, col, read_row);
+            if (!orb_exists(src->orb)) continue;
 
-            GridOrb *dst = &p->board[board_get_index(col, write_row)];
+            BoardCell *dst = board_get_cell(p, col, write_row);
             if (read_row != write_row) {
+                Orb moved_orb = src->orb;
                 dst->orb = src->orb;
-                dst->orb.flags |= ORB_MOVING;
-                dst->move_from_row = read_row;
-                dst->marked = false;
-
                 src->orb = {};
-                src->marked = false;
-                src->move_from_row = read_row;
-            } else {
-                dst->move_from_row = write_row;
+
+                BoardEvent event = {};
+                event.type = BOARDEVENT_ORB_MOVED;
+                event.orb = moved_orb;
+                event.from_col = col;
+                event.from_row = read_row;
+                event.to_col = col;
+                event.to_row = write_row;
+                push_board_event(events, event);
             }
 
             write_row++;
@@ -175,20 +375,183 @@ static void apply_board_gravity(PlayerState *p) {
     }
 }
 
-static void update_board(PlayerState *p) {
+static void update_board(PlayerState *p, BoardResolveScratch *scratch, BoardEventBuffer *events) {
     for (u32 i = 0; i < TOTAL_BOARD_SIZE; ++i) {
-        GridOrb *o = p->board + i;
-        ORB_CLEAR_FLAGS(&o->orb, ORB_MOVING);
+        if (!scratch->to_remove[i]) continue;
 
-        if (o->marked) {
-            o->orb = {};
-            o->marked = false;
-        }
+        BoardCell *cell = &p->board[i];
+        if (!orb_exists(cell->orb)) continue;
 
-        ORB_CLEAR_FLAGS(&o->orb, ORB_JUST_DROPPED);
+        BoardEvent event = {};
+        event.type = BOARDEVENT_ORB_REMOVED;
+        event.orb = cell->orb;
+        event.from_col = i % PLAYERFIELD_COLS;
+        event.from_row = i / PLAYERFIELD_COLS;
+        event.to_col = event.from_col;
+        event.to_row = event.from_row;
+        push_board_event(events, event);
+
+        cell->orb = {};
     }
 
-    apply_board_gravity(p);
+    apply_board_gravity(p, events);
+}
+
+// ---
+// visuals helpers
+// ---
+
+static OrbVisual* get_or_create_visual(PlayerVisualState *visual_state, OrbId id) {
+    ASSERT(visual_state && id > 0);
+
+    // TODO: Grab from free list?
+
+    i32 first_free_index = -1;
+    for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
+        OrbVisual *o = &visual_state->visuals[i];
+
+        if (first_free_index < 0 && !o->active) {
+            first_free_index = i;
+        }
+
+        if (o->active && o->id == id) return o;
+    }
+
+    ASSERT(first_free_index >= 0);
+    OrbVisual *visual = &visual_state->visuals[first_free_index];
+    memzero_struct(visual);
+
+    visual->active = true;
+    visual->id = id;
+    return visual;
+}
+
+static OrbVisual *find_active_visual(PlayerVisualState *visual_state, OrbId id) {
+    if (!visual_state || id == ORB_ID_NONE) return 0;
+
+    for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
+        OrbVisual *visual = &visual_state->visuals[i];
+        if (visual->active && visual->id == id) return visual;
+    }
+
+    return 0;
+}
+
+static void update_visual_state(PlayerVisualState *visual_state, f32 dt) {
+    for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
+        OrbVisual *visual = &visual_state->visuals[i];
+        if (!visual->active) continue;
+
+        if (visual->duration > 0.f) {
+            visual->t = clamp01(visual->t + (dt / visual->duration));
+        } else {
+            visual->t = 1.f;
+        }
+
+        switch (visual->state) {
+            case ORBVISUAL_MOVING: {
+                visual->pos = lerp_v2(visual->from_pos, visual->to_pos, visual->t);
+                if (visual->t >= 1.f) {
+                    visual->active = false;
+                    visual->state = ORBVISUAL_IDLE;
+                }
+            } break;
+
+            case ORBVISUAL_REMOVING: {
+                visual->pos = visual->from_pos;
+                if (visual->t >= 1.f) {
+                    visual->active = false;
+                    visual->state = ORBVISUAL_IDLE;
+                }
+            } break;
+
+            default: {
+                visual->active = false;
+                visual->state = ORBVISUAL_IDLE;
+            } break;
+        }
+    }
+}
+
+static void draw_orb_rect(v2 pos, v2 dim, OrbType type) {
+    DrawRectangleRec(make_rect(pos, dim), get_orb_render_color(type));
+}
+
+static void draw_visual_state(PlayerVisualState *visual_state, const PlayerFieldLayout *layout) {
+    for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
+        OrbVisual *visual = &visual_state->visuals[i];
+        if (!visual->active) continue;
+
+        v2 pos = visual->pos;
+        v2 dim = layout->orb_dim;
+        Color color = get_orb_render_color(visual->type);
+
+        if (visual->state == ORBVISUAL_REMOVING) {
+            f32 scale = 1.f - (0.35f * clamp01(visual->t));
+            dim *= scale;
+            pos += (layout->orb_dim - dim) * 0.5f;
+            color.a = (unsigned char) (255.f * (1.f - clamp01(visual->t)));
+        }
+
+        DrawRectangleRec(make_rect(pos, dim), color);
+    }
+}
+
+// ---
+// player state stuff
+// ---
+
+static inline void clear_player_state(PlayerState *p) {
+    // Clear everything
+    memset(p, 0, sizeof(PlayerState));
+
+    // Set initial position to be middle col
+    p->at_col = (u8) PLAYERFIELD_COLS / 2;
+    p->next_orb_id = 1;
+}
+
+static void events_to_visual(BoardEventBuffer *event_buffer, PlayerVisualState *visual_state, const PlayerFieldLayout *layout) {
+    for (u32 i = 0; i < event_buffer->count; ++i) {
+        BoardEvent *event = &event_buffer->events[i];
+
+        OrbId id = event->orb.id;
+        if (id < 1) continue; // Invalid OrbId
+
+        switch (event->type) {
+            case BOARDEVENT_ORB_MOVED: {
+                OrbVisual *visual = get_or_create_visual(visual_state, id);
+                visual->type      = event->orb.type;
+                visual->from_pos  = board_cell_to_screen(layout, event->from_col, event->from_row);
+                visual->to_pos    = board_cell_to_screen(layout, event->to_col, event->to_row);
+                visual->pos       = visual->from_pos;
+                visual->t         = 0;
+                visual->duration  = ORB_MOVE_DURATION;
+                visual->state     = ORBVISUAL_MOVING;
+            } break;
+
+            case BOARDEVENT_ORB_REMOVED: {
+                OrbVisual *visual = get_or_create_visual(visual_state, id);
+                visual->type      = event->orb.type;
+                visual->from_pos  = board_cell_to_screen(layout, event->from_col, event->from_row);
+                visual->to_pos    = visual->from_pos;
+                visual->pos       = visual->from_pos;
+                visual->t         = 0;
+                visual->duration  = ORB_REMOVE_DURATION;
+                visual->state     = ORBVISUAL_REMOVING;
+            } break;
+
+            // case BOARDEVENT_ORB_HELD: {
+            //     OrbVisual *visual = get_or_create_visual(visual_state, id);
+            //     visual->from_pos  = board_cell_to_screen(layout, event->from_col, event->from_row);
+            //     visual->to_pos    = board_cell_to_screen(layout, event->to_col, event->to_row);
+            //     visual->t         = 0;
+            //     visual->duration  = ORB_MOVE_DURATION;
+            //     visual->state     = ORBVISUAL_MOVING;
+            // } break;
+
+            default: continue;
+        }
+    }
 }
 
 static void update_game(GameState *game, GameInput *new_input) {
@@ -196,52 +559,48 @@ static void update_game(GameState *game, GameInput *new_input) {
         clear_player_state(&game->player_1);
         clear_player_state(&game->player_2);
 
-        build_board_links(&game->player_1);
-        build_board_links(&game->player_2);
-
         populate_random_rows(&game->player_1, 4);
         populate_random_rows(&game->player_2, 4);
-
-        // Temp hack
-        {
-            GridOrb *o = &game->player_1.board[board_get_index(3, 0)];
-            for (u32 i = 0; i < 4; ++i) {
-                o->orb.type = ORB_PINK;
-                o = o->neighbor_down;
-            }
-
-            o = &game->player_1.board[board_get_index(2, 2)];
-            o->orb.type = ORB_PINK;
-            o = o->neighbor_down;
-            o->orb.type = ORB_PINK;
-
-            o = &game->player_1.board[board_get_index(4, 3)];
-            o->orb.type = ORB_PINK;
-        }
 
         game->initialized = true;
     }
 
+    BoardResolveScratch p1_scratch = {};
+    BoardResolveScratch p2_scratch = {};
+    BoardEventBuffer p1_events = {};
+    BoardEventBuffer p2_events = {};
+
     PlayerState *p1 = &game->player_1;
-    i8 player_at = p1->at_col;
+    PlayerState *p2 = &game->player_2;
+    const GameRenderLayout *render_layout = &GAME_RENDER_LAYOUT;
 
     u32 controller = new_input->controller;
 
     // Movement
+    i8 player_at = p1->at_col;
     if (controller & GAMEINPUT_MOV_LEFT)  player_at -= 1;
     if (controller & GAMEINPUT_MOV_RIGHT) player_at += 1;
 
     if (player_at < 0)                 player_at = 0;
     if (player_at >= PLAYERFIELD_COLS) player_at = PLAYERFIELD_COLS - 1;
 
+    // TODO: Generate cursor move event into p1_events
     p1->at_col = player_at;
 
     // Stack interaction
-    if (controller & GAMEINPUT_MOV_DOWN) attempt_to_pull_stack(p1);
-    if (controller & GAMEINPUT_MOV_UP)   attempt_to_push_stack(p1);
+    if (controller & GAMEINPUT_MOV_DOWN) attempt_to_pull_stack(p1, &p1_events);
+    if (controller & GAMEINPUT_MOV_UP)   attempt_to_push_stack(p1, &p1_scratch, &p1_events);
 
-    update_board(&game->player_1);
-    update_board(&game->player_2);
+    // Update board and generate events
+    update_board(&game->player_1, &p1_scratch, &p1_events);
+    update_board(&game->player_2, &p2_scratch, &p2_events);
+
+    // Translate all events into visual state
+    events_to_visual(&p1_events, &p1->visual_state, &render_layout->player_1);
+    events_to_visual(&p2_events, &p2->visual_state, &render_layout->player_2);
+
+    update_visual_state(&p1->visual_state, new_input->time_delta_seconds);
+    update_visual_state(&p2->visual_state, new_input->time_delta_seconds);
 }
 
 static void render_game(GameState *game) {
@@ -249,23 +608,12 @@ static void render_game(GameState *game) {
 
     ClearBackground(CLEARCOLOR);
 
-    int inner_w = TARGET_WIDTH * 0.5;
-    int inner_h = TARGET_HEIGHT * 0.9;
-    int inner_x_offset = (TARGET_WIDTH - inner_w) / 2;
-    int inner_y_offset = (TARGET_HEIGHT - inner_h) / 2;
-
-    v2 inner_tl = make_v2(inner_x_offset, inner_y_offset);
-    v2 inner_wh = make_v2(inner_w, inner_h);
-
-    f32 pf_gap = inner_wh.x * 0.1;
-    f32 pf_bot = 40.f;
-    v2  pf_wh  = make_v2((inner_w - pf_gap) * 0.5f, inner_h - pf_bot);
-
-    v2 pf1_tl = inner_tl;
-    v2 pf2_tl = inner_tl + make_v2(pf_gap + pf_wh.x, 0);
-
-    v2 cell_wh = make_v2(pf_wh.x / PLAYERFIELD_COLS);
-    v2 pf_gutter_wh = make_v2(pf_wh.x, pf_wh.y - (cell_wh.y * PLAYERFIELD_ROWS));
+    const GameRenderLayout *layout = &GAME_RENDER_LAYOUT;
+    v2 pf1_tl = layout->player_1.field_tl;
+    v2 pf2_tl = layout->player_2.field_tl;
+    v2 pf_wh = layout->player_1.field_wh;
+    v2 cell_wh = layout->player_1.cell_wh;
+    v2 pf_gutter_wh = layout->player_1.gutter_wh;
 
     // Visualize grid
     {
@@ -321,28 +669,26 @@ static void render_game(GameState *game) {
         DrawRectangleRec(player2_rect, ORANGE);
 
         // Board
-        v2 orb_pad = make_v2(4, 4);
-        v2 orb_dim = cell_wh - (orb_pad * 2.);
         for (u32 row = 0; row < PLAYERFIELD_ROWS; ++row) {
             for (u32 col = 0; col < PLAYERFIELD_COLS; ++col) {
-                v2 grid_pos = hadamard(make_v2(col, row), cell_wh);
+                v2 p1_orb_pos = board_cell_to_screen(&layout->player_1, col, row);
+                v2 p2_orb_pos = board_cell_to_screen(&layout->player_2, col, row);
 
-                v2 p1_orb_pos = pf1_tl + grid_pos + orb_pad;
-                v2 p2_orb_pos = pf2_tl + grid_pos + orb_pad;
+                BoardCell *p1_cell = board_get_cell(p1, col, row);
+                BoardCell *p2_cell = board_get_cell(p2, col, row);
 
-                Rectangle p1_orb_rect = make_rect(p1_orb_pos, orb_dim);
-                Rectangle p2_orb_rect = make_rect(p2_orb_pos, orb_dim);
+                if (orb_exists(p1_cell->orb) && !find_active_visual(&p1->visual_state, p1_cell->orb.id)) {
+                    draw_orb_rect(p1_orb_pos, layout->player_1.orb_dim, p1_cell->orb.type);
+                }
 
-                GridOrb *p1_go = &p1->board[board_get_index(col, row)];
-                GridOrb *p2_go = &p2->board[board_get_index(col, row)];
-
-                Color p1_c = p1_go->marked ? BLACK : get_orb_render_color(p1_go->orb.type);
-                Color p2_c = p2_go->marked ? BLACK : get_orb_render_color(p2_go->orb.type);
-
-                if (p1_go->orb.type > ORB_NONE) DrawRectangleRec(p1_orb_rect, p1_c);
-                if (p2_go->orb.type > ORB_NONE) DrawRectangleRec(p2_orb_rect, p2_c);
+                if (orb_exists(p2_cell->orb) && !find_active_visual(&p2->visual_state, p2_cell->orb.id)) {
+                    draw_orb_rect(p2_orb_pos, layout->player_2.orb_dim, p2_cell->orb.type);
+                }
             }
         }
+
+        draw_visual_state(&p1->visual_state, &layout->player_1);
+        draw_visual_state(&p2->visual_state, &layout->player_2);
 
         // Hold
         {
@@ -353,11 +699,11 @@ static void render_game(GameState *game) {
 
             v2 r_dim = make_v2(10.f, 10.f);
             f32 gap = 5.f;
-            for (u32 i = 0; i < p1->hold_count; ++i) {
+            for (u32 i = 0; i < p1->hold.count; ++i) {
                 v2 r_offs = make_v2(-r_dim.x, -r_dim.y * i - gap);
 
                 Rectangle r = make_rect(p1_stack_pos + r_offs, r_dim);
-                DrawRectangleRec(r, get_orb_render_color(p1->hold_type));
+                DrawRectangleRec(r, get_orb_render_color(p1->hold.type));
             }
             // DrawRectangleRec(p2_hold_rect, ORANGE);
         }
