@@ -107,23 +107,24 @@ struct BoardResolveScratch {
 #define ORB_MOVE_DURATION    0.15f
 #define ORB_REMOVE_DURATION  0.12f
 
-enum OrbVisualState {
-    ORBVISUAL_IDLE,
-    ORBVISUAL_MOVING,
-    ORBVISUAL_REMOVING,
-    ORBVISUAL_HELD,
+enum OrbAnimationState {
+    ORBANIM_IDLE,
+    ORBANIM_MOVING,
+    ORBANIM_REMOVING,
+    ORBANIM_HELD,
 };
 
-struct OrbVisual {
+struct OrbAnimation {
     b32 active;
 
     OrbId id;
     OrbType type;
-    OrbVisualState state;
+    OrbAnimationState state;
 
-    v2 from_pos;
-    v2 to_pos;
-    v2 pos;
+    u32 from_col;
+    u32 from_row;
+    u32 to_col;
+    u32 to_row;
 
     f32 t;
     f32 duration;
@@ -131,8 +132,8 @@ struct OrbVisual {
 
 // Should account for max orbs in field + held in hand
 #define MAX_PLAYER_ORBS 128 
-struct PlayerVisualState {
-    OrbVisual visuals[MAX_PLAYER_ORBS];
+struct PlayerAnimationState {
+    OrbAnimation animations[MAX_PLAYER_ORBS];
 };
 
 struct PlayerState {
@@ -143,7 +144,7 @@ struct PlayerState {
     BoardCell board[TOTAL_BOARD_SIZE];
     OrbId next_orb_id;
 
-    PlayerVisualState visual_state;
+    PlayerAnimationState animation_state;
 };
 
 struct StackView {

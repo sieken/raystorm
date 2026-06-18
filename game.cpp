@@ -398,17 +398,17 @@ static void update_board(PlayerState *p, BoardResolveScratch *scratch, BoardEven
 }
 
 // ---
-// visuals helpers
+// animation helpers
 // ---
 
-static OrbVisual* get_or_create_visual(PlayerVisualState *visual_state, OrbId id) {
-    ASSERT(visual_state && id > 0);
+static OrbAnimation* get_or_create_animation(PlayerAnimationState *animation_state, OrbId id) {
+    ASSERT(animation_state && id > 0);
 
     // TODO: Grab from free list?
 
     i32 first_free_index = -1;
     for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
-        OrbVisual *o = &visual_state->visuals[i];
+        OrbAnimation *o = &animation_state->animations[i];
 
         if (first_free_index < 0 && !o->active) {
             first_free_index = i;
@@ -418,56 +418,54 @@ static OrbVisual* get_or_create_visual(PlayerVisualState *visual_state, OrbId id
     }
 
     ASSERT(first_free_index >= 0);
-    OrbVisual *visual = &visual_state->visuals[first_free_index];
-    memzero_struct(visual);
+    OrbAnimation *animation = &animation_state->animations[first_free_index];
+    memzero_struct(animation);
 
-    visual->active = true;
-    visual->id = id;
-    return visual;
+    animation->active = true;
+    animation->id = id;
+    return animation;
 }
 
-static OrbVisual *find_active_visual(PlayerVisualState *visual_state, OrbId id) {
-    if (!visual_state || id == ORB_ID_NONE) return 0;
+static OrbAnimation *find_active_animation(PlayerAnimationState *animation_state, OrbId id) {
+    if (!animation_state || id == ORB_ID_NONE) return 0;
 
     for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
-        OrbVisual *visual = &visual_state->visuals[i];
-        if (visual->active && visual->id == id) return visual;
+        OrbAnimation *animation = &animation_state->animations[i];
+        if (animation->active && animation->id == id) return animation;
     }
 
     return 0;
 }
 
-static void update_visual_state(PlayerVisualState *visual_state, f32 dt) {
+static void update_animation_state(PlayerAnimationState *animation_state, f32 dt) {
     for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
-        OrbVisual *visual = &visual_state->visuals[i];
-        if (!visual->active) continue;
+        OrbAnimation *animation = &animation_state->animations[i];
+        if (!animation->active) continue;
 
-        if (visual->duration > 0.f) {
-            visual->t = clamp01(visual->t + (dt / visual->duration));
+        if (animation->duration > 0.f) {
+            animation->t = clamp01(animation->t + (dt / animation->duration));
         } else {
-            visual->t = 1.f;
+            animation->t = 1.f;
         }
 
-        switch (visual->state) {
-            case ORBVISUAL_MOVING: {
-                visual->pos = lerp_v2(visual->from_pos, visual->to_pos, visual->t);
-                if (visual->t >= 1.f) {
-                    visual->active = false;
-                    visual->state = ORBVISUAL_IDLE;
+        switch (animation->state) {
+            case ORBANIM_MOVING: {
+                if (animation->t >= 1.f) {
+                    animation->active = false;
+                    animation->state = ORBANIM_IDLE;
                 }
             } break;
 
-            case ORBVISUAL_REMOVING: {
-                visual->pos = visual->from_pos;
-                if (visual->t >= 1.f) {
-                    visual->active = false;
-                    visual->state = ORBVISUAL_IDLE;
+            case ORBANIM_REMOVING: {
+                if (animation->t >= 1.f) {
+                    animation->active = false;
+                    animation->state = ORBANIM_IDLE;
                 }
             } break;
 
             default: {
-                visual->active = false;
-                visual->state = ORBVISUAL_IDLE;
+                animation->active = false;
+                animation->state = ORBANIM_IDLE;
             } break;
         }
     }
@@ -477,20 +475,22 @@ static void draw_orb_rect(v2 pos, v2 dim, OrbType type) {
     DrawRectangleRec(make_rect(pos, dim), get_orb_render_color(type));
 }
 
-static void draw_visual_state(PlayerVisualState *visual_state, const PlayerFieldLayout *layout) {
+static void draw_animation_state(PlayerAnimationState *animation_state, const PlayerFieldLayout *layout) {
     for (u32 i = 0; i < MAX_PLAYER_ORBS; ++i) {
-        OrbVisual *visual = &visual_state->visuals[i];
-        if (!visual->active) continue;
+        OrbAnimation *animation = &animation_state->animations[i];
+        if (!animation->active) continue;
 
-        v2 pos = visual->pos;
+        v2 from_pos = board_cell_to_screen(layout, animation->from_col, animation->from_row);
+        v2 to_pos   = board_cell_to_screen(layout, animation->to_col, animation->to_row);
+        v2 pos = lerp_v2(from_pos, to_pos, animation->t);
         v2 dim = layout->orb_dim;
-        Color color = get_orb_render_color(visual->type);
+        Color color = get_orb_render_color(animation->type);
 
-        if (visual->state == ORBVISUAL_REMOVING) {
-            f32 scale = 1.f - (0.35f * clamp01(visual->t));
+        if (animation->state == ORBANIM_REMOVING) {
+            f32 scale = 1.f - (0.35f * clamp01(animation->t));
             dim *= scale;
             pos += (layout->orb_dim - dim) * 0.5f;
-            color.a = (unsigned char) (255.f * (1.f - clamp01(visual->t)));
+            color.a = (unsigned char) (255.f * (1.f - clamp01(animation->t)));
         }
 
         DrawRectangleRec(make_rect(pos, dim), color);
@@ -510,7 +510,7 @@ static inline void clear_player_state(PlayerState *p) {
     p->next_orb_id = 1;
 }
 
-static void events_to_visual(BoardEventBuffer *event_buffer, PlayerVisualState *visual_state, const PlayerFieldLayout *layout) {
+static void apply_board_events_to_animations(BoardEventBuffer *event_buffer, PlayerAnimationState *animation_state) {
     for (u32 i = 0; i < event_buffer->count; ++i) {
         BoardEvent *event = &event_buffer->events[i];
 
@@ -519,34 +519,38 @@ static void events_to_visual(BoardEventBuffer *event_buffer, PlayerVisualState *
 
         switch (event->type) {
             case BOARDEVENT_ORB_MOVED: {
-                OrbVisual *visual = get_or_create_visual(visual_state, id);
-                visual->type      = event->orb.type;
-                visual->from_pos  = board_cell_to_screen(layout, event->from_col, event->from_row);
-                visual->to_pos    = board_cell_to_screen(layout, event->to_col, event->to_row);
-                visual->pos       = visual->from_pos;
-                visual->t         = 0;
-                visual->duration  = ORB_MOVE_DURATION;
-                visual->state     = ORBVISUAL_MOVING;
+                OrbAnimation *animation = get_or_create_animation(animation_state, id);
+                animation->type      = event->orb.type;
+                animation->from_col  = event->from_col;
+                animation->from_row  = event->from_row;
+                animation->to_col    = event->to_col;
+                animation->to_row    = event->to_row;
+                animation->t         = 0;
+                animation->duration  = ORB_MOVE_DURATION;
+                animation->state     = ORBANIM_MOVING;
             } break;
 
             case BOARDEVENT_ORB_REMOVED: {
-                OrbVisual *visual = get_or_create_visual(visual_state, id);
-                visual->type      = event->orb.type;
-                visual->from_pos  = board_cell_to_screen(layout, event->from_col, event->from_row);
-                visual->to_pos    = visual->from_pos;
-                visual->pos       = visual->from_pos;
-                visual->t         = 0;
-                visual->duration  = ORB_REMOVE_DURATION;
-                visual->state     = ORBVISUAL_REMOVING;
+                OrbAnimation *animation = get_or_create_animation(animation_state, id);
+                animation->type      = event->orb.type;
+                animation->from_col  = event->from_col;
+                animation->from_row  = event->from_row;
+                animation->to_col    = event->from_col;
+                animation->to_row    = event->from_row;
+                animation->t         = 0;
+                animation->duration  = ORB_REMOVE_DURATION;
+                animation->state     = ORBANIM_REMOVING;
             } break;
 
             // case BOARDEVENT_ORB_HELD: {
-            //     OrbVisual *visual = get_or_create_visual(visual_state, id);
-            //     visual->from_pos  = board_cell_to_screen(layout, event->from_col, event->from_row);
-            //     visual->to_pos    = board_cell_to_screen(layout, event->to_col, event->to_row);
-            //     visual->t         = 0;
-            //     visual->duration  = ORB_MOVE_DURATION;
-            //     visual->state     = ORBVISUAL_MOVING;
+            //     OrbAnimation *animation = get_or_create_animation(animation_state, id);
+            //     animation->from_col  = event->from_col;
+            //     animation->from_row  = event->from_row;
+            //     animation->to_col    = event->to_col;
+            //     animation->to_row    = event->to_row;
+            //     animation->t         = 0;
+            //     animation->duration  = ORB_MOVE_DURATION;
+            //     animation->state     = ORBANIM_MOVING;
             // } break;
 
             default: continue;
@@ -572,7 +576,6 @@ static void update_game(GameState *game, GameInput *new_input) {
 
     PlayerState *p1 = &game->player_1;
     PlayerState *p2 = &game->player_2;
-    const GameRenderLayout *render_layout = &GAME_RENDER_LAYOUT;
 
     u32 controller = new_input->controller;
 
@@ -595,12 +598,11 @@ static void update_game(GameState *game, GameInput *new_input) {
     update_board(&game->player_1, &p1_scratch, &p1_events);
     update_board(&game->player_2, &p2_scratch, &p2_events);
 
-    // Translate all events into visual state
-    events_to_visual(&p1_events, &p1->visual_state, &render_layout->player_1);
-    events_to_visual(&p2_events, &p2->visual_state, &render_layout->player_2);
+    apply_board_events_to_animations(&p1_events, &p1->animation_state);
+    apply_board_events_to_animations(&p2_events, &p2->animation_state);
 
-    update_visual_state(&p1->visual_state, new_input->time_delta_seconds);
-    update_visual_state(&p2->visual_state, new_input->time_delta_seconds);
+    update_animation_state(&p1->animation_state, new_input->time_delta_seconds);
+    update_animation_state(&p2->animation_state, new_input->time_delta_seconds);
 }
 
 static void render_game(GameState *game) {
@@ -677,18 +679,18 @@ static void render_game(GameState *game) {
                 BoardCell *p1_cell = board_get_cell(p1, col, row);
                 BoardCell *p2_cell = board_get_cell(p2, col, row);
 
-                if (orb_exists(p1_cell->orb) && !find_active_visual(&p1->visual_state, p1_cell->orb.id)) {
+                if (orb_exists(p1_cell->orb) && !find_active_animation(&p1->animation_state, p1_cell->orb.id)) {
                     draw_orb_rect(p1_orb_pos, layout->player_1.orb_dim, p1_cell->orb.type);
                 }
 
-                if (orb_exists(p2_cell->orb) && !find_active_visual(&p2->visual_state, p2_cell->orb.id)) {
+                if (orb_exists(p2_cell->orb) && !find_active_animation(&p2->animation_state, p2_cell->orb.id)) {
                     draw_orb_rect(p2_orb_pos, layout->player_2.orb_dim, p2_cell->orb.type);
                 }
             }
         }
 
-        draw_visual_state(&p1->visual_state, &layout->player_1);
-        draw_visual_state(&p2->visual_state, &layout->player_2);
+        draw_animation_state(&p1->animation_state, &layout->player_1);
+        draw_animation_state(&p2->animation_state, &layout->player_2);
 
         // Hold
         {
