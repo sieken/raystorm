@@ -15,8 +15,6 @@ int main(int argc, char* argv[]) {
         if (game.mode == GAMEMODE_GAME) {
             GameInput new_input = {};
 
-            new_input.time_delta_seconds = GetFrameTime();
-
             if (IsKeyPressed(KEY_A) || IsKeyPressed(KEY_J)) new_input.controller |= GAMEINPUT_MOV_LEFT;
             if (IsKeyPressed(KEY_W) || IsKeyPressed(KEY_I)) new_input.controller |= GAMEINPUT_MOV_UP;
             if (IsKeyPressed(KEY_D) || IsKeyPressed(KEY_L)) new_input.controller |= GAMEINPUT_MOV_RIGHT;

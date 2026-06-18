@@ -39,10 +39,6 @@ struct Orb {
     OrbId id;
 };
 
-struct BoardCell {
-    Orb orb;
-};
-
 // NOTE: These values are used as direction indices in board traversal.
 enum StackDirection {
     STACKDIR_UP = 0,
@@ -69,12 +65,6 @@ static inline StackDirection opposite_dir(StackDirection dir) {
 #define PLAYERFIELD_ROWS 14
 #define PLAYER_HOLD_SIZE PLAYERFIELD_ROWS / 2
 #define TOTAL_BOARD_SIZE PLAYERFIELD_ROWS * PLAYERFIELD_COLS
-
-struct HeldStack {
-    Orb orbs[PLAYER_HOLD_SIZE];
-    u32 count;
-    OrbType type;
-};
 
 enum BoardEventType {
     BOARDEVENT_ORB_MOVED,
@@ -104,56 +94,14 @@ struct BoardResolveScratch {
     bool visited[TOTAL_BOARD_SIZE];
 };
 
-#define ORB_MOVE_DURATION    0.15f
-#define ORB_REMOVE_DURATION  0.12f
-
-enum OrbAnimationState {
-    ORBANIM_IDLE,
-    ORBANIM_MOVING,
-    ORBANIM_REMOVING,
-    ORBANIM_HELD,
-};
-
-struct OrbAnimation {
-    b32 active;
-
-    OrbId id;
-    OrbType type;
-    OrbAnimationState state;
-
-    u32 from_col;
-    u32 from_row;
-    u32 to_col;
-    u32 to_row;
-
-    f32 t;
-    f32 duration;
-};
-
-// Should account for max orbs in field + held in hand
-#define MAX_PLAYER_ORBS 128 
-struct PlayerAnimationState {
-    OrbAnimation animations[MAX_PLAYER_ORBS];
-};
-
 struct PlayerState {
     u32 at_col;
 
-    HeldStack hold;
+    Orb hold[PLAYER_HOLD_SIZE];
+    u32 hold_count;
 
-    BoardCell board[TOTAL_BOARD_SIZE];
+    Orb board[TOTAL_BOARD_SIZE];
     OrbId next_orb_id;
-
-    PlayerAnimationState animation_state;
-};
-
-struct StackView {
-    PlayerState *player;
-    u32 col;
-    i32 top_row;
-    StackDirection dir;
-    u32 count;
-    u32 max;
 };
 
 enum GameControllerInput {
@@ -168,8 +116,6 @@ enum GameControllerInput {
 };
 
 struct GameInput {
-    f32 time_delta_seconds;
-
     u32 controller;         // GameControllerInput flags
 };
 
