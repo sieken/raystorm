@@ -558,7 +558,8 @@ static void apply_board_events_to_animations(BoardEventBuffer *event_buffer, Pla
     }
 }
 
-static void update_game(GameState *game, GameInput *new_input) {
+static void update_game_simulation(GameState *game, GameInput *new_input,
+                                   BoardEventBuffer *p1_events, BoardEventBuffer *p2_events) {
     if (!game->initialized) {
         clear_player_state(&game->player_1);
         clear_player_state(&game->player_2);
@@ -571,11 +572,8 @@ static void update_game(GameState *game, GameInput *new_input) {
 
     BoardResolveScratch p1_scratch = {};
     BoardResolveScratch p2_scratch = {};
-    BoardEventBuffer p1_events = {};
-    BoardEventBuffer p2_events = {};
 
     PlayerState *p1 = &game->player_1;
-    PlayerState *p2 = &game->player_2;
 
     u32 controller = new_input->controller;
 
@@ -591,18 +589,32 @@ static void update_game(GameState *game, GameInput *new_input) {
     p1->at_col = player_at;
 
     // Stack interaction
-    if (controller & GAMEINPUT_MOV_DOWN) attempt_to_pull_stack(p1, &p1_events);
-    if (controller & GAMEINPUT_MOV_UP)   attempt_to_push_stack(p1, &p1_scratch, &p1_events);
+    if (controller & GAMEINPUT_MOV_DOWN) attempt_to_pull_stack(p1, p1_events);
+    if (controller & GAMEINPUT_MOV_UP)   attempt_to_push_stack(p1, &p1_scratch, p1_events);
 
     // Update board and generate events
-    update_board(&game->player_1, &p1_scratch, &p1_events);
-    update_board(&game->player_2, &p2_scratch, &p2_events);
+    update_board(&game->player_1, &p1_scratch, p1_events);
+    update_board(&game->player_2, &p2_scratch, p2_events);
+}
 
-    apply_board_events_to_animations(&p1_events, &p1->animation_state);
-    apply_board_events_to_animations(&p2_events, &p2->animation_state);
+static void apply_game_events_to_client(GameState *game, BoardEventBuffer *p1_events,
+                                        BoardEventBuffer *p2_events, f32 dt) {
+    PlayerState *p1 = &game->player_1;
+    PlayerState *p2 = &game->player_2;
 
-    update_animation_state(&p1->animation_state, new_input->time_delta_seconds);
-    update_animation_state(&p2->animation_state, new_input->time_delta_seconds);
+    apply_board_events_to_animations(p1_events, &p1->animation_state);
+    apply_board_events_to_animations(p2_events, &p2->animation_state);
+
+    update_animation_state(&p1->animation_state, dt);
+    update_animation_state(&p2->animation_state, dt);
+}
+
+static void update_game(GameState *game, GameInput *new_input) {
+    BoardEventBuffer p1_events = {};
+    BoardEventBuffer p2_events = {};
+
+    update_game_simulation(game, new_input, &p1_events, &p2_events);
+    apply_game_events_to_client(game, &p1_events, &p2_events, new_input->time_delta_seconds);
 }
 
 static void render_game(GameState *game) {
