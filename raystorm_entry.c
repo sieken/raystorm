@@ -7,11 +7,22 @@
 GameState game = {};
 
 int main(int argc, char* argv[]) {
+    ThreadContext *thread_ctx = thread_ctx_alloc();
+    ctx_select(thread_ctx);
+
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "raystorm");
 
     SetTargetFPS(60);
 
+    game.target_tick_rate = 60;
+
+    EventLog events = { .arena = arena_alloc(MB(1), KB(10)), .events = 0, .first_free = 0 };
+
+    game.debugfont = LoadFont("/home/sieken/gamedev/chainstorm/assets/fonts/Albura-Regular.ttf");
+
     while (!WindowShouldClose()) {
+        f32 frame_delta = GetFrameTime();
+
         if (game.mode == GAMEMODE_GAME) {
             GameInput new_input = {};
 
@@ -22,15 +33,19 @@ int main(int argc, char* argv[]) {
 
             if (IsKeyPressed(KEY_SPACE)) new_input.controller |= GAMEINPUT_ACT_PRIMARY;
 
-            update_game(&game, &new_input);
+            update_game(&game, &new_input, &events);
         }
 
+        update_events(&events, frame_delta);
+
         if (game.mode == GAMEMODE_GAME) {
-            render_game(&game);
+            render_game(&game, &events);
         }
     }
 
     CloseWindow();
+
+    thread_ctx_release(thread_ctx);
 
     return 0;
 }
