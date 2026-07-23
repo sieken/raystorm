@@ -10,8 +10,36 @@
 #include <myr_math.h>
 #include <myr_arena.h>
 
+typedef u64 PlayerId;
+
+#define PLAYER_1_ID    123
+#define PLAYER_2_ID    456
+
+enum Player {
+    PLAYER1 = 0,
+    PLAYER2,
+
+    MAX_PLAYER_COUNT
+};
+
 typedef u32 OrbId;
 #define ORB_ID_NONE 0
+
+enum OrbType {
+    ORB_NONE = 0,
+
+    ORB_PINK,
+    ORB_YELLOW,
+    ORB_BLUE,
+    ORB_GREEN,
+
+    ORB_MAX
+};
+
+struct Orb {
+    OrbType type;
+    OrbId id;
+};
 
 enum BoardCommandType {
     BOARDCMD_MOVE_CURSOR_LEFT,
@@ -19,11 +47,6 @@ enum BoardCommandType {
     BOARDCMD_PULL_STACK,
     BOARDCMD_PUSH_STACK
 };
-
-typedef u64 PlayerId;
-
-#define PLAYER_1_ID    123
-#define PLAYER_2_ID    456
 
 struct BoardCommand {
     BoardCommandType type;
@@ -41,27 +64,15 @@ enum BoardEventType {
 
     BOARDEVENT_CURSOR_MOVED,
 
+    BOARDEVENT_CLEAR_GROUP_STAGED,
+    BOARDEVENT_CLEAR_BATCH_COMMITTED,
+    BOARDEVENT_CHAIN_COMMITTED,
+
+    BOARDEVENT_EXPIRE_TICK_UPDATED,
+
     BOARDEVENT_PLAYER_ELIMINATED,
 
     BOARDEVENT_GAME_OVER
-};
-
-enum OrbType {
-    ORB_NONE = 0,
-
-    ORB_PINK,
-    ORB_YELLOW,
-    ORB_BLUE,
-    ORB_GREEN,
-
-    ORB_MAX
-};
-
-enum Player {
-    PLAYER1 = 0,
-    PLAYER2,
-
-    MAX_PLAYER_COUNT
 };
 
 struct GameResult {
@@ -71,20 +82,62 @@ struct GameResult {
     PlayerId winners[MAX_PLAYER_COUNT];
 };
 
+// TODO: These should probably be unbounded
+#define MAX_CLEAR_GROUPS_PER_STEP 32
+#define MAX_REACTION_STEPS        16
+
+#define CLEARGROUP_TRIG_BY_PLAYER  (1 << 0)
+#define CLEARGROUP_TRIG_BY_GRAVITY (1 << 1)
+
+#define PLAYERFIELD_COLS 7
+#define PLAYERFIELD_ROWS 14
+#define PLAYER_HOLD_SIZE PLAYERFIELD_ROWS / 2
+#define TOTAL_BOARD_SIZE PLAYERFIELD_ROWS * PLAYERFIELD_COLS
+
+struct ClearGroup {
+    u32 flags;
+    OrbType type;
+    u32 count;
+    u32 cells[TOTAL_BOARD_SIZE]; // Contains cell/board indices
+};
+
+struct ClearBatchStats {
+    u32 total_cleared_orbs;
+    u32 total_cleared_groups;
+    u32 groups_cleared_by_gravity;
+    u32 groups_cleared_by_player;
+    u32 largest_group;
+    u32 largest_group_type;
+    u32 groups_cleared_by_color[ORB_MAX];
+};
+
+struct ChainStats {
+    u32 chain_depth;
+    u64 tick_committed;
+    ClearBatchStats total;
+};
+
 struct BoardEvent {
     BoardEventType type;
     PlayerId player_id;
     u64 event_seq;
 
-    OrbId   orb_id;
-    OrbType orb_type;
+    union {
+        struct {
+            OrbId   orb_id;
+            OrbType orb_type;
 
-    u32 from_col;
-    u32 from_row;
-    u32 to_col;
-    u32 to_row;
-
-    GameResult result;
+            u32 from_col;
+            u32 from_row;
+            u32 to_col;
+            u32 to_row;
+        };
+        ClearGroup clear_group; // TODO: Is it worth sending a whole clear group?
+        ClearBatchStats clear_batch_stats;
+        ChainStats chain;
+        GameResult result;
+        u64 batch_expire_tick;
+    };
 };
 
 static inline Color get_orb_render_color(OrbType o) {
@@ -97,11 +150,6 @@ static inline Color get_orb_render_color(OrbType o) {
     }
 }
 
-struct Orb {
-    OrbType type;
-    OrbId id;
-};
-
 // NOTE: These values are used as direction indices in board traversal.
 enum StackDirection {
     STACKDIR_UP = 0,
@@ -112,23 +160,6 @@ enum StackDirection {
     STACKDIR_INVALID
 };
 
-static inline StackDirection opposite_dir(StackDirection dir) {
-    ASSERT(dir < STACKDIR_INVALID);
-
-    switch (dir) {
-        case STACKDIR_UP: return STACKDIR_DOWN;
-        case STACKDIR_RIGHT: return STACKDIR_LEFT;
-        case STACKDIR_DOWN: return STACKDIR_UP;
-        case STACKDIR_LEFT: return STACKDIR_RIGHT;
-        default: return STACKDIR_INVALID; // NOTE: Unchecked, maybe worth going INVALID_CODEPATH here?
-    }
-}
-
-#define PLAYERFIELD_COLS 7
-#define PLAYERFIELD_ROWS 14
-#define PLAYER_HOLD_SIZE PLAYERFIELD_ROWS / 2
-#define TOTAL_BOARD_SIZE PLAYERFIELD_ROWS * PLAYERFIELD_COLS
-
 #define MAX_BOARD_EVENTS 256
 struct BoardEventBuffer {
     u64 tick;
@@ -136,33 +167,9 @@ struct BoardEventBuffer {
     u32 count;
 };
 
-// TODO: These should probably be unbounded
-#define MAX_CLEAR_GROUPS_PER_STEP 32
-#define MAX_REACTION_STEPS        16
-struct ClearGroup {
-    OrbType type;
-    u32 count;
-    u32 cells[TOTAL_BOARD_SIZE];
-};
-struct ReactionStep {
-    u32 clear_group_count;
-    ClearGroup clear_groups[MAX_CLEAR_GROUPS_PER_STEP];
-};
-struct ComboResolution {
-    PlayerId player;
-    u32 reaction_step_count;
-    ReactionStep steps[MAX_REACTION_STEPS];
-
-    u32 total_orbs_cleared;
-    u32 total_clear_groups;
-    u32 largest_group;
-};
-
 struct BoardResolveScratch {
-    bool candidates[TOTAL_BOARD_SIZE];
-    bool to_remove[TOTAL_BOARD_SIZE];
-    bool visited[TOTAL_BOARD_SIZE];
-    ComboResolution combo;
+    b32 candidates[TOTAL_BOARD_SIZE];
+    b32 taken_by_clear_group[TOTAL_BOARD_SIZE];
 };
 
 struct GameTickScratch {
@@ -184,6 +191,25 @@ enum PlayerCondition {
     PLAYER_ELIMINATED,
 };
 
+#define CLEAR_GROUPS_MAX 256 // TODO: Make this dynamic with arena
+#define CLEAR_BATCH_INITIAL_TICKS 70
+#define CLEAR_BATCH_EXTEND_TICKS  40
+#define CLEAR_BATCH_INVALID_TICK  0
+struct ClearBatch {
+    u64 expire_tick;
+    u32 clear_group_count;
+    ClearGroup clear_groups[CLEAR_GROUPS_MAX];
+};
+
+#define CLEAR_BATCH_MAX 256 // TODO: Make this dynamic with arena
+struct Chain {
+    u32 chain_depth;
+
+    ClearBatchStats chain_info[CLEAR_BATCH_MAX];
+
+    ClearBatch staged_batch; // NOTE: Ensure this always has a valid current state
+};
+
 #define PLAYER_SPECIAL_MAX 24
 #define PLAYER_ULTRA_MAX   24
 struct PlayerState {
@@ -201,6 +227,9 @@ struct PlayerState {
 
     Orb board[TOTAL_BOARD_SIZE];
     Orb deadzone[PLAYERFIELD_COLS];
+
+    Chain      staged_chain;
+    ChainStats last_chain;
 };
 
 enum GameControllerInput {

@@ -174,6 +174,11 @@ static inline Orb *board_get_cell(PlayerState *p, u32 x, u32 y) {
     return &p->board[board_get_index(x, y)];
 }
 
+static inline Orb *board_get_cell_from_index(PlayerState *p, u32 index) {
+    ASSERT(index < TOTAL_BOARD_SIZE);
+    return &p->board[index];
+}
+
 static inline b32 orb_exists(Orb orb) {
     return orb.type > ORB_NONE;
 }
@@ -243,7 +248,7 @@ static inline u32 column_push(PlayerState *p, u32 col, Orb orb) {
     return dst_row;
 }
 
-static void attempt_to_pull_stack(BoardEventBuffer *events, PlayerState *p) {
+static void attempt_to_pull_stack(BoardEventBuffer *events, PlayerState *p, BoardResolveScratch *scratch) {
     ASSERT(p->at_col < PLAYERFIELD_COLS);
 
     u32 height = column_height(p, p->at_col);
@@ -256,7 +261,10 @@ static void attempt_to_pull_stack(BoardEventBuffer *events, PlayerState *p) {
     // Count how many to pull
     u32 pull_count = 0;
     i32 top_row = (i32) height - 1;
-    while (top_row >= 0 && board_get_cell(p, p->at_col, (u32) top_row)->type == ref) {
+    while (top_row >= 0
+        && board_get_cell(p, p->at_col, (u32) top_row)->type == ref
+        && !scratch->taken_by_clear_group[board_get_index(p->at_col, top_row)])
+    {
         pull_count++;
         top_row--;
     }
@@ -309,9 +317,6 @@ static inline OrbType random_orb(void)  {
     return (OrbType) GetRandomValue(ORB_NONE + 1, ORB_MAX - 1);
 }
 
-// TODO: This function is starting to get kind of stupid,
-//       please remove and replace with something better
-//       for initialization
 static inline void populate_random_rows(GameServer *server, Player player, u32 rows) {
     ASSERT(server);
     ASSERT(player < MAX_PLAYER_COUNT);
@@ -327,32 +332,10 @@ static inline void populate_random_rows(GameServer *server, Player player, u32 r
     }
 }
 
-static inline void clear_reaction_marks(BoardResolveScratch *scratch) {
-    memzero(scratch->visited, sizeof(scratch->visited));
-    memzero(scratch->to_remove, sizeof(scratch->to_remove));
-}
-
-static inline void clear_reaction_candidates(BoardResolveScratch *scratch) {
-    memzero(scratch->candidates, sizeof(scratch->candidates));
-}
-
-static inline void combo_record_step(ComboResolution *combo, ReactionStep *step) {
-    ASSERT(combo->reaction_step_count < MAX_REACTION_STEPS);
-
-    combo->steps[combo->reaction_step_count++] = *step;
-
-    for (u32 i = 0; i < step->clear_group_count; ++i) {
-        ClearGroup *group = &step->clear_groups[i];
-        combo->total_clear_groups++;
-        combo->total_orbs_cleared += group->count;
-        if (combo->largest_group < group->count) combo->largest_group = group->count;
-    }
-}
-
-static void collect_matching_group(PlayerState *p, BoardResolveScratch *scratch, u32 start_index, ClearGroup *group, bool *has_non_candidate) {
+static void collect_matching_group(PlayerState *p, b32 candidates[TOTAL_BOARD_SIZE], b32 visited[TOTAL_BOARD_SIZE], b32 taken_by_clear_group[TOTAL_BOARD_SIZE], u32 start_index, ClearGroup *group, bool *has_non_candidate) {
+    ASSERT(p && candidates && visited);
     ASSERT(start_index < TOTAL_BOARD_SIZE);
-    ASSERT(group);
-    ASSERT(has_non_candidate);
+    ASSERT(group && has_non_candidate);
 
     OrbType type = p->board[start_index].type;
     if (type == ORB_NONE) return;
@@ -364,20 +347,20 @@ static void collect_matching_group(PlayerState *p, BoardResolveScratch *scratch,
     // Evaluate all entries in the stack until stack is empty
     while (stack_count > 0) {
         u32 index = stack[--stack_count];
-        if (scratch->visited[index]) continue; // We have already evaluated this
+        if (visited[index] || taken_by_clear_group[index]) continue; // We have already evaluated this
 
         u32 col = index % PLAYERFIELD_COLS;
         u32 row = index / PLAYERFIELD_COLS;
         Orb *cell = board_get_cell(p, col, row);
         if (cell->type != type) continue;     // Non-matching type, do not include in group
 
-        scratch->visited[index] = true;
+        visited[index] = true;
 
         ASSERT(group->count < TOTAL_BOARD_SIZE);
         group->cells[group->count++] = index;
         group->type = type;
 
-        if (!scratch->candidates[index]) *has_non_candidate = true;
+        if (!candidates[index]) *has_non_candidate = true;
 
         // Chains trigger in the cardinal directions, check all neighbors
         for (u32 dir = 0; dir < STACKDIR_INVALID; ++dir) {
@@ -395,65 +378,11 @@ static void collect_matching_group(PlayerState *p, BoardResolveScratch *scratch,
             if (!board_in_bounds(next_col, next_row)) continue;
 
             u32 next_index = board_get_index((u32) next_col, (u32) next_row);
-            if (scratch->visited[next_index]) continue;
+            if (visited[next_index]) continue;
             if (p->board[next_index].type != type) continue;
 
             ASSERT(stack_count < TOTAL_BOARD_SIZE);
             stack[stack_count++] = next_index; // Add neighbor to stack for evaluation
-        }
-    }
-}
-
-static bool find_reaction_step_from_candidates(PlayerState *p, BoardResolveScratch *scratch, ReactionStep *step) {
-    ASSERT(p && scratch && step);
-
-    clear_reaction_marks(scratch);
-    *step = {};
-
-    for (u32 i = 0; i < TOTAL_BOARD_SIZE; ++i) {
-        // Only check unvisited, existing candidates
-        if (scratch->visited[i]
-            || !orb_exists(p->board[i])
-            || !scratch->candidates[i]) continue;
-
-        // Start of new clear group
-        ClearGroup group = {};
-        bool has_non_candidate = false;
-        collect_matching_group(p, scratch, i, &group, &has_non_candidate);
-
-        // Valid groups/chain reactions have non-candidate entries
-        if (group.count > 1 && has_non_candidate) {
-            ASSERT(step->clear_group_count < MAX_CLEAR_GROUPS_PER_STEP);
-            step->clear_groups[step->clear_group_count++] = group;
-
-            for (u32 cell_index = 0; cell_index < group.count; ++cell_index) {
-                scratch->to_remove[group.cells[cell_index]] = true;
-            }
-        }
-    }
-
-    return step->clear_group_count > 0;
-}
-
-static void clear_reaction_step_orbs(PlayerState *p, ReactionStep *step, BoardEventBuffer *events) {
-    for (u32 group_index = 0; group_index < step->clear_group_count; ++group_index) {
-        ClearGroup *group = &step->clear_groups[group_index];
-
-        for (u32 cell_index = 0; cell_index < group->count; ++cell_index) {
-            u32 index = group->cells[cell_index];
-            Orb *cell = &p->board[index];
-            if (!orb_exists(*cell)) continue;
-
-            BoardEvent event = {};
-            event.type = BOARDEVENT_ORB_REMOVED;
-            event.orb_id = cell->id;
-            event.from_col = index % PLAYERFIELD_COLS;
-            event.from_row = index / PLAYERFIELD_COLS;
-            event.to_col = event.from_col;
-            event.to_row = event.from_row;
-            push_board_event(events, p, event);
-
-            *cell = {};
         }
     }
 }
@@ -486,22 +415,6 @@ static void apply_board_gravity(PlayerState *p, BoardResolveScratch *scratch, Bo
 
             write_row++;
         }
-    }
-}
-
-static void resolve_board_reactions(PlayerState *p, BoardResolveScratch *scratch, BoardEventBuffer *events) {
-    scratch->combo.player = p->id;
-
-    for (;;) {
-        if (scratch->combo.reaction_step_count >= MAX_REACTION_STEPS) break;
-
-        ReactionStep step = {};
-        if (!find_reaction_step_from_candidates(p, scratch, &step)) break;
-
-        combo_record_step(&scratch->combo, &step);
-        clear_reaction_candidates(scratch);
-        clear_reaction_step_orbs(p, &step, events);
-        apply_board_gravity(p, scratch, events);
     }
 }
 
@@ -547,6 +460,22 @@ static void draw_player_cursor(PlayerState *player, const PlayerFieldLayout *lay
 }
 
 static void draw_player_board(PlayerState *player, const PlayerFieldLayout *layout) {
+    ClearBatch *batch = &player->staged_chain.staged_batch;
+    for (u32 i = 0; i < batch->clear_group_count; ++i) {
+        ClearGroup *cg = &batch->clear_groups[i];
+
+        for (u32 c = 0; c < cg->count; ++c) {
+            u32 orb_index = cg->cells[c];
+            u32 col = orb_index % PLAYERFIELD_COLS;
+            u32 row = orb_index / PLAYERFIELD_COLS;
+
+            v2 rect_tl = layout->field_tl + hadamard(make_v2(col, row), layout->cell_wh);
+            v2 rect_wh = layout->cell_wh;
+            Color color = ColorAlpha(MAROON, 0.5f);
+            DrawRectangleRec(make_rect(rect_tl, rect_wh), color);
+        }
+    }
+
     for (u32 row = 0; row < PLAYERFIELD_ROWS; ++row) {
         for (u32 col = 0; col < PLAYERFIELD_COLS; ++col) {
             Orb *orb = board_get_cell(player, col, row);
@@ -751,6 +680,7 @@ static void resolve_pending_effects(GameServer *server, BoardEventBuffer *event_
     }
 }
 
+#if 0
 static void apply_combo_rewards(GameServer *server, ComboResolution *combo, BoardEventBuffer *event_buf) {
     if (combo->reaction_step_count == 0) return;
 
@@ -758,6 +688,68 @@ static void apply_combo_rewards(GameServer *server, ComboResolution *combo, Boar
         enqueue_pending_effect(server, BOARDEFFECT_SPAWN_RANDOM_ROW, PLAYER2);
     }
 
+}
+#endif
+
+static inline void board_map_mark(b32 bmap[TOTAL_BOARD_SIZE], u32 index) {
+    ASSERT(index < TOTAL_BOARD_SIZE);
+    bmap[index] = true;
+}
+
+static inline ClearBatch* get_player_staged_batch(BoardState *bs, Player player) {
+    ASSERT(player < MAX_PLAYER_COUNT);
+    return &bs->players[player].staged_chain.staged_batch;
+}
+
+static ClearBatchStats summarize_clear_batch_stats(ClearBatch *batch) {
+    ASSERT(batch);
+
+    ClearBatchStats stats = {};
+
+    for (u32 i = 0; i < batch->clear_group_count; ++i) {
+        ClearGroup *cg = &batch->clear_groups[i];
+
+        if (cg->flags & CLEARGROUP_TRIG_BY_GRAVITY) stats.groups_cleared_by_gravity += 1;
+        if (cg->flags & CLEARGROUP_TRIG_BY_PLAYER)  stats.groups_cleared_by_player  += 1;
+
+        if (cg->count > stats.largest_group) {
+            stats.largest_group = cg->count;
+            stats.largest_group_type = cg->type;
+        }
+
+        stats.groups_cleared_by_color[cg->type] += 1;
+        stats.total_cleared_orbs += cg->count;
+    }
+
+    stats.total_cleared_groups = batch->clear_group_count;
+
+    return stats;
+}
+
+// Sweep through board, check candidates against visited and taken, construct new clear groups and insert into batch
+static u32 sweep_board_for_clear_groups(PlayerState *ps, BoardResolveScratch *player_scratch, ClearBatch *batch, u32 group_flags) {
+    u32 groups_found = 0;
+    b32 visited[TOTAL_BOARD_SIZE] = {0};
+    for (u32 i = 0; i < TOTAL_BOARD_SIZE; ++i) {
+        if (visited[i] || !orb_exists(ps->board[i]) || !player_scratch->candidates[i]) continue;
+
+        // We should have a candidate in a valid starting position here,
+        // treat as start of new clear group, and see if we can gather more
+        ClearGroup group = {};
+        bool has_non_candidate = false;
+        collect_matching_group(ps, player_scratch->candidates, visited, player_scratch->taken_by_clear_group, i, &group, &has_non_candidate);
+
+        // Only count cleargroup as valid if it contains at least one non-candidate entry,
+        // otherwise it means we have only managed to find groups within the current drop
+        if (group.count > 1 && has_non_candidate) {
+            ASSERT(batch->clear_group_count < CLEAR_GROUPS_MAX); // TODO: Make dynamic and unbounded
+            group.flags |= group_flags;
+            batch->clear_groups[batch->clear_group_count++] = group;
+            groups_found++;
+        }
+    }
+
+    return groups_found;
 }
 
 static void gamestate_tick(GameServer *server, BoardCommandBuffer *cmd_buf, BoardEventBuffer *event_buf) {
@@ -770,6 +762,20 @@ static void gamestate_tick(GameServer *server, BoardCommandBuffer *cmd_buf, Boar
 
     GameTickScratch scratch = {};
     BoardState *boardstate = &server->boardstate;
+
+    // Cells that are already taken by clear groups should not count towards
+    // new clear groups for now, so we mark them first from the staged batch
+    for (u32 p = 0; p < MAX_PLAYER_COUNT; ++p) {
+        PlayerState *ps = &boardstate->players[p];
+        if (ps->condition < PLAYER_ACTIVE) continue;
+
+        ClearBatch *staged_batch = get_player_staged_batch(boardstate, (Player) p);
+        BoardResolveScratch *player_scratch = &scratch.players[p];
+        for (u32 i = 0; i < staged_batch->clear_group_count; ++i) {
+            ClearGroup *cg = &staged_batch->clear_groups[i];
+            for (u32 c = 0; c < cg->count; ++c) board_map_mark(player_scratch->taken_by_clear_group, cg->cells[c]);
+        }
+    }
 
     // Process commands
     for (u32 i = 0; i < cmd_buf->count; ++i) {
@@ -799,19 +805,175 @@ static void gamestate_tick(GameServer *server, BoardCommandBuffer *cmd_buf, Boar
             st->at_col = player_at;
 
             // Consume and validate board interaction
-            if (e->type == BOARDCMD_PULL_STACK) attempt_to_pull_stack(event_buf, st);
+            if (e->type == BOARDCMD_PULL_STACK) attempt_to_pull_stack(event_buf, st, sc);
             if (e->type == BOARDCMD_PUSH_STACK) attempt_to_push_stack(event_buf, st, sc);
         }
-
-        // TODO: Add special handling for other conditions here if they should be allowed
-        //       send commands
     }
 
-    // Resolve board updates
+    // After processing all incoming commands from players, we can now start
+    // evaluating the state for each player into player-triggered clear groups
+    // to add to the staged batch, and then check if we should apply gravity
+    // and check for gravity-triggered clear groups as well.
     for (u32 p = PLAYER1; p < MAX_PLAYER_COUNT; ++p) {
-        if (boardstate->players[p].condition < PLAYER_ACTIVE) continue;
-        resolve_board_reactions(&boardstate->players[p], &scratch.players[p], event_buf);
-        apply_combo_rewards(server, &scratch.players[p].combo, event_buf);
+        // TODO: We check that the current player is active quite often,
+        //       consider maybe just grabbing all active players into one
+        //       array instead, and we wouldn't have to loop over all
+        //       players either
+        PlayerState *ps = &boardstate->players[p];
+        if (ps->condition < PLAYER_ACTIVE) continue;
+
+        BoardResolveScratch *player_scratch = &scratch.players[p];
+        ClearBatch *staged_batch = get_player_staged_batch(boardstate, (Player) p);
+
+        b32 visited[TOTAL_BOARD_SIZE] = {};
+        ClearBatch temp_batch = {};
+        sweep_board_for_clear_groups(ps, player_scratch, &temp_batch, CLEARGROUP_TRIG_BY_PLAYER);
+
+        // This seems like a dumb way to do it, as opposed to just appending directly inside sweep_board,
+        // and it probably is. For now though, it remains as a desperate attempt at gaining some semblance of control.
+        // And maybe I just don't like functions appending straight into persistent state!!!
+        ASSERT((staged_batch->clear_group_count + temp_batch.clear_group_count) < CLEAR_GROUPS_MAX); // TODO: Dynamic and unbounded
+        for (u32 i = 0; i < temp_batch.clear_group_count; ++i) {
+            staged_batch->clear_groups[staged_batch->clear_group_count++] = temp_batch.clear_groups[i];
+
+            BoardEvent event = {};
+            event.type = BOARDEVENT_CLEAR_GROUP_STAGED;
+            event.clear_group = temp_batch.clear_groups[i];
+            push_board_event(event_buf, ps, event);
+        }
+
+        // If we found any clear groups generated by player, we want to
+        // extend the clear batch
+        if (temp_batch.clear_group_count > 0) {
+            u64 prev_expire_tick = staged_batch->expire_tick;
+
+            u64 ext_amount = 0;
+            if (staged_batch->expire_tick == CLEAR_BATCH_INVALID_TICK) ext_amount = CLEAR_BATCH_INITIAL_TICKS;
+            else                                                       ext_amount = CLEAR_BATCH_EXTEND_TICKS;
+
+            u64 new_expire_tick = current_tick + ext_amount;
+            if (new_expire_tick > staged_batch->expire_tick) staged_batch->expire_tick = current_tick + ext_amount;
+
+            if (staged_batch->expire_tick != prev_expire_tick) {
+                BoardEvent event = {};
+                event.type = BOARDEVENT_EXPIRE_TICK_UPDATED;
+                event.batch_expire_tick = staged_batch->expire_tick;
+                push_board_event(event_buf, ps, event);
+            }
+        }
+
+        b32 batch_expired = staged_batch->expire_tick > CLEAR_BATCH_INVALID_TICK && staged_batch->expire_tick <= current_tick;
+
+        if (batch_expired) {
+            // This batch has expired, we need to:
+            // 1. Mark batch orbs for deletion
+            // 2. Commit staged batch to chain
+            // 3. Reset staged_batch
+            // 4. Apply gravity
+            // 5. Find gravity-triggered clear groups
+            // 6. If no gravity-triggered clear groups, then chain is dead
+            //    Else, append to new batch and set new batch time
+
+            // Mark orbs for deletion
+            for (u32 i = 0; i < staged_batch->clear_group_count; ++i) {
+                ClearGroup *cg = &staged_batch->clear_groups[i];
+                for (u32 c = 0; c < cg->count; ++c) {
+                    u32 orb_index = cg->cells[c];
+                    Orb *cell = &ps->board[orb_index];
+                    if (!orb_exists(*cell)) {
+                        // TODO: Debug/INVALID_CODEPATH;
+                        continue;
+                    }
+
+                    BoardEvent event = {};
+                    event.type = BOARDEVENT_ORB_REMOVED;
+                    event.orb_id = cell->id;
+                    event.from_col = orb_index % PLAYERFIELD_COLS;
+                    event.from_row = orb_index / PLAYERFIELD_COLS;
+                    event.to_col = event.from_col;
+                    event.to_row = event.from_row;
+                    push_board_event(event_buf, ps, event);
+
+                    *cell = {};
+                }
+            }
+
+            // Commit staged batch to chain
+            ClearBatchStats stats = summarize_clear_batch_stats(staged_batch);
+            ps->staged_chain.chain_info[ps->staged_chain.chain_depth++] = stats;
+
+            BoardEvent event = {};
+            event.type = BOARDEVENT_CLEAR_BATCH_COMMITTED;
+            event.clear_batch_stats = stats;
+            push_board_event(event_buf, ps, event);
+
+            // Reset staged_batch
+            staged_batch->expire_tick = CLEAR_BATCH_INVALID_TICK;
+            staged_batch->clear_group_count = 0; // TODO: Reset arena
+
+            // Get new empty scratch
+            // (We could reset and re-use the one we've used above, but it should be all cleared out anyway)
+            BoardResolveScratch gravity_scratch = {};
+
+            // Apply gravity
+            apply_board_gravity(ps, &gravity_scratch, event_buf);
+
+            // Find gravity-triggered clear groups
+            memzero_struct(&temp_batch);
+            sweep_board_for_clear_groups(ps, &gravity_scratch, &temp_batch, CLEARGROUP_TRIG_BY_GRAVITY);
+
+            // If we found gravity-triggered clear groups, then append to new batch and set new batch time
+            // else, the chain is dead
+            if (temp_batch.clear_group_count > 0) {
+                staged_batch->expire_tick = current_tick + CLEAR_BATCH_INITIAL_TICKS;
+                for (u32 i = 0; i < temp_batch.clear_group_count; ++i) {
+                    staged_batch->clear_groups[staged_batch->clear_group_count++] = temp_batch.clear_groups[i];
+
+                    BoardEvent event = {};
+                    event.type = BOARDEVENT_CLEAR_GROUP_STAGED;
+                    event.clear_group = temp_batch.clear_groups[i];
+                    push_board_event(event_buf, ps, event);
+                }
+
+                BoardEvent event = {};
+                event.type = BOARDEVENT_EXPIRE_TICK_UPDATED;
+                event.batch_expire_tick = staged_batch->expire_tick;
+                push_board_event(event_buf, ps, event);
+            } else {
+                // Chain dead (long live chain), commit chain, reset chain
+                Chain *player_chain = &ps->staged_chain;
+
+                ChainStats cs = {};
+                cs.chain_depth = player_chain->chain_depth;
+                for (u32 i = 0; i < player_chain->chain_depth; ++i) {
+                    ClearBatchStats *cbs = &player_chain->chain_info[i];
+
+                    cs.total.total_cleared_groups      += cbs->total_cleared_groups;
+                    cs.total.total_cleared_orbs        += cbs->total_cleared_orbs;
+                    cs.total.groups_cleared_by_gravity += cbs->groups_cleared_by_gravity;
+                    cs.total.groups_cleared_by_player  += cbs->groups_cleared_by_player;
+
+                    if (cbs->largest_group > cs.total.largest_group) {
+                        cs.total.largest_group      = cbs->largest_group;
+                        cs.total.largest_group_type = cbs->largest_group_type;
+                    }
+
+                    for (u32 c = 0; c < ORB_MAX; ++c) cs.total.groups_cleared_by_color[c] += cbs->groups_cleared_by_color[c];
+                }
+
+                cs.tick_committed = current_tick;
+
+                BoardEvent event = {};
+                event.type = BOARDEVENT_CHAIN_COMMITTED;
+                event.chain = cs;
+                push_board_event(event_buf, ps, event);
+
+                ps->last_chain = cs;
+
+                // Reset staged chain, probably just resetting the depth is enough
+                player_chain->chain_depth = 0;
+            }
+        }
     }
 
     // Timeout updates
@@ -889,10 +1051,10 @@ static void apply_events(GameClient *client, BoardEventBuffer *events) {
         BoardEvent *e = &events->events[i];
 
         PlayerState *st = boardstate_get_player(state, e->player_id);
+        ASSERT(st);
 
         switch (e->type) {
             case BOARDEVENT_ORB_MOVED: {
-                ASSERT(st);
                 ASSERT(e->from_col < PLAYERFIELD_COLS);
                 ASSERT(e->from_row < PLAYERFIELD_ROWS);
                 ASSERT(e->to_col < PLAYERFIELD_COLS);
@@ -910,7 +1072,6 @@ static void apply_events(GameClient *client, BoardEventBuffer *events) {
             } break;
 
             case BOARDEVENT_ORB_REMOVED: {
-                ASSERT(st);
                 ASSERT(e->from_col < PLAYERFIELD_COLS);
                 ASSERT(e->from_row < PLAYERFIELD_ROWS);
 
@@ -923,7 +1084,6 @@ static void apply_events(GameClient *client, BoardEventBuffer *events) {
             } break;
 
             case BOARDEVENT_ORB_HELD: {
-                ASSERT(st);
                 ASSERT(e->from_col < PLAYERFIELD_COLS);
                 ASSERT(e->from_row < PLAYERFIELD_ROWS);
                 ASSERT(st->hold_count < PLAYER_HOLD_SIZE);
@@ -938,7 +1098,6 @@ static void apply_events(GameClient *client, BoardEventBuffer *events) {
             } break;
 
             case BOARDEVENT_ORB_RELEASED: {
-                ASSERT(st);
                 ASSERT(e->to_col < PLAYERFIELD_COLS);
                 ASSERT(e->to_row < PLAYERFIELD_ROWS);
                 ASSERT(st->hold_count > 0);
@@ -953,7 +1112,6 @@ static void apply_events(GameClient *client, BoardEventBuffer *events) {
             } break;
 
             case BOARDEVENT_ORB_DEADZONED: {
-                ASSERT(st);
                 ASSERT(e->to_col < PLAYERFIELD_COLS);
                 ASSERT(e->to_row >= PLAYERFIELD_ROWS);
 
@@ -968,7 +1126,6 @@ static void apply_events(GameClient *client, BoardEventBuffer *events) {
             } break;
 
             case BOARDEVENT_ORB_SPAWNED: {
-                ASSERT(st);
                 ASSERT(e->to_col < PLAYERFIELD_COLS);
                 ASSERT(e->to_row < PLAYERFIELD_ROWS);
 
@@ -982,13 +1139,31 @@ static void apply_events(GameClient *client, BoardEventBuffer *events) {
             } break;
 
             case BOARDEVENT_CURSOR_MOVED: {
-                ASSERT(st);
                 ASSERT(e->to_col < PLAYERFIELD_COLS);
                 st->at_col = e->to_col;
             } break;
 
+            case BOARDEVENT_CLEAR_GROUP_STAGED: {
+                ClearBatch *staged_batch = &st->staged_chain.staged_batch;
+                staged_batch->clear_groups[staged_batch->clear_group_count++] = e->clear_group;
+            } break;
+
+            case BOARDEVENT_CLEAR_BATCH_COMMITTED: {
+                st->staged_chain.chain_info[st->staged_chain.chain_depth++] = e->clear_batch_stats;
+                st->staged_chain.staged_batch.expire_tick = CLEAR_BATCH_INVALID_TICK;
+                st->staged_chain.staged_batch.clear_group_count = 0;
+            } break;
+
+            case BOARDEVENT_CHAIN_COMMITTED: {
+                st->staged_chain.chain_depth = 0;
+                st->last_chain = e->chain;
+            } break;
+
+            case BOARDEVENT_EXPIRE_TICK_UPDATED: {
+                st->staged_chain.staged_batch.expire_tick = e->batch_expire_tick;
+            } break;
+
             case BOARDEVENT_PLAYER_ELIMINATED: {
-                ASSERT(st);
                 st->condition = PLAYER_ELIMINATED;
             } break;
 
@@ -1037,6 +1212,26 @@ static void log_events(EventLog *log, BoardEventBuffer *events, u64 tick) {
 
             case BOARDEVENT_ORB_SPAWNED: {
                 u32 count = snprintf(msg, 63, "[%zu][P_%zu] Orb [%d] spawned!!", tick, e->player_id, e->orb_id);
+                event_push(log, msg, count);
+            } break;
+
+            case BOARDEVENT_CLEAR_GROUP_STAGED: {
+                u32 count = snprintf(msg, 63, "[%zu][P_%zu] Clear group staged!", tick, e->player_id);
+                event_push(log, msg, count);
+            } break;
+
+            case BOARDEVENT_CLEAR_BATCH_COMMITTED: {
+                u32 count = snprintf(msg, 63, "[%zu][P_%zu] Clear batch committed!", tick, e->player_id);
+                event_push(log, msg, count);
+            } break;
+
+            case BOARDEVENT_CHAIN_COMMITTED: {
+                u32 count = snprintf(msg, 63, "[%zu][P_%zu] Chain committed - %d orbs cleared!", tick, e->player_id, e->chain.total.total_cleared_orbs);
+                event_push(log, msg, count);
+            } break;
+
+            case BOARDEVENT_EXPIRE_TICK_UPDATED: {
+                u32 count = snprintf(msg, 63, "[%zu][P_%zu] Staged batch tick updated to: %ld", tick, e->player_id, e->batch_expire_tick);
                 event_push(log, msg, count);
             } break;
 
