@@ -271,22 +271,23 @@ enum BoardEffectType {
 };
 
 struct BoardEffect {
+    BoardEffect *next;
     u64 target_tick;
     BoardEffectType type;
     Player target_player;
 };
 
-#define MAX_PENDING_EFFECTS    64
-#define MAX_SCHEDULED_EFFECTS 256
+struct BoardEffectAllocator {
+    Arena *arena;
+    BoardEffect *first_free;
+};
+
 struct GameServer {
     GameResult result;
     BoardControl control;
     BoardState boardstate;
 
-    u32 pending_effects_count;
-    BoardEffect pending_effects[MAX_PENDING_EFFECTS];
-    u32 scheduled_effects_count;
-    BoardEffect scheduled_effects[MAX_SCHEDULED_EFFECTS];
+    BoardEffect *scheduled_effects;
 };
 
 struct GameClient {

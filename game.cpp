@@ -76,6 +76,8 @@ static Arena* ctx_get_scratch(Arena **conflicts, u64 count) {
 __thread u64 cmd_seq = 0;
 __thread u64 event_seq = 0;
 
+BoardEffectAllocator board_effect_allocator;
+
 #define cmd_seq_next() (cmd_seq++)
 #define event_seq_next() (event_seq++)
 
@@ -650,20 +652,68 @@ static void push_game_over_events(GameServer *server, BoardEventBuffer *event_bu
     }
 }
 
-static void enqueue_pending_effect(GameServer *server, BoardEffectType effect, Player target_player) {
-    ASSERT(server->pending_effects_count < MAX_PENDING_EFFECTS);
-    ASSERT(target_player >= PLAYER1 && target_player < MAX_PLAYER_COUNT);
+static BoardEffect *
+allocate_board_effect(BoardEffectAllocator *a)
+{
+    BoardEffect *effect = a->first_free;
+    if (effect != 0) {
+        a->first_free = effect->next;
+        memzero_struct(effect);
+    } else {
+        effect = push_struct_zero(a->arena, BoardEffect);
+    }
 
-    BoardEffect e = {};
-    e.type = effect;
-    e.target_player = target_player;
-    server->pending_effects[server->pending_effects_count++] = e;
+    return effect;
 }
 
-// NOTE: Does not clear the pending effects, intentionally
-static void resolve_pending_effects(GameServer *server, BoardEventBuffer *event_buf) {
-    for (u32 i = 0; i < server->pending_effects_count; ++i) {
-        BoardEffect *e = &server->pending_effects[i];
+static void
+free_board_effect(BoardEffectAllocator *a, BoardEffect *effect)
+{
+    effect->next = a->first_free;
+    a->first_free = effect;
+}
+
+static void
+schedule_board_effect(GameServer *server, BoardEffectType effect, Player target_player, u64 target_tick)
+{
+    BoardEffect *e = allocate_board_effect(&board_effect_allocator);
+    e->type = effect;
+    e->target_player = target_player;
+    e->target_tick = target_tick;
+
+    e->next = server->scheduled_effects;
+    server->scheduled_effects = e;
+}
+
+// TODO: Rewrite with passed arena
+static u32
+get_scheduled_effects_for_tick(GameServer *server, BoardEffect *buf, u32 max, u64 target_tick)
+{
+    u32 count = 0;
+
+    BoardEffect **link = &server->scheduled_effects;
+    while (*link && count < max) {
+        BoardEffect *effect = *link;
+
+        if (effect->target_tick <= target_tick) {
+            buf[count++] = *effect;
+            buf[count - 1].next = 0;
+
+            *link = effect->next;
+            free_board_effect(&board_effect_allocator, effect);
+        } else {
+            link = &effect->next;
+        }
+    }
+
+    return count;
+}
+
+static void
+resolve_pending_effects(GameServer *server, BoardEffect *pending_effects, u32 count, BoardEventBuffer *event_buf)
+{
+    for (u32 i = 0; i < count; ++i) {
+        BoardEffect *e = &pending_effects[i];
         PlayerState *p = &server->boardstate.players[e->target_player];
 
         // Maybe some effects should affect inactive players,
@@ -672,7 +722,14 @@ static void resolve_pending_effects(GameServer *server, BoardEventBuffer *event_
 
         switch (e->type) {
             case BOARDEFFECT_SPAWN_RANDOM_ROW: {
-                spawn_random_row(server, e->target_player, event_buf);
+                // Only spawn rows if we do not have any active chains
+                b32 active_chain = p->staged_chain.staged_batch.expire_tick != CLEAR_BATCH_INVALID_TICK;
+                if (active_chain) {
+                    // Reschedule
+                    schedule_board_effect(server, e->type, e->target_player, p->staged_chain.staged_batch.expire_tick);
+                } else {
+                    spawn_random_row(server, e->target_player, event_buf);
+                }
             } break;
 
             default: continue;
@@ -755,8 +812,6 @@ static u32 sweep_board_for_clear_groups(PlayerState *ps, BoardResolveScratch *pl
 static void gamestate_tick(GameServer *server, BoardCommandBuffer *cmd_buf, BoardEventBuffer *event_buf) {
     GameResult *result = &server->result;
     if (result->game_over) return;
-
-    server->pending_effects_count = 0;
 
     u64 current_tick = event_buf->tick;
 
@@ -980,12 +1035,15 @@ static void gamestate_tick(GameServer *server, BoardCommandBuffer *cmd_buf, Boar
     BoardControl *control = &server->control;
     if (control->random_spawn_tick_interval) {
         if (current_tick >= control->next_random_spawn_tick) {
-            enqueue_pending_effect(server, BOARDEFFECT_SPAWN_RANDOM_ROW, PLAYER1);
-            enqueue_pending_effect(server, BOARDEFFECT_SPAWN_RANDOM_ROW, PLAYER2);
+            schedule_board_effect(server, BOARDEFFECT_SPAWN_RANDOM_ROW, PLAYER1, current_tick);
+            schedule_board_effect(server, BOARDEFFECT_SPAWN_RANDOM_ROW, PLAYER2, current_tick);
         }
     }
 
-    resolve_pending_effects(server, event_buf);
+    // Resolve any effects that should occur this tick
+    BoardEffect pending_effects[16];
+    u32 pending_count = get_scheduled_effects_for_tick(server, pending_effects, 16, current_tick);
+    resolve_pending_effects(server, pending_effects, pending_count, event_buf);
 
     // Check deadzones and eliminations
     u32 win_candidate_count = 0;
@@ -1253,6 +1311,10 @@ static void log_events(EventLog *log, BoardEventBuffer *events, u64 tick) {
     }
 }
 
+static void destroy_game(GameState *game) {
+    arena_release(board_effect_allocator.arena);
+}
+
 static void update_game(GameState *game, GameInput *new_input, EventLog *log) {
     // Temp game initialization in here for now
     if (!game->initialized) {
@@ -1271,6 +1333,8 @@ static void update_game(GameState *game, GameInput *new_input, EventLog *log) {
 
         BoardSnapshot snap = make_board_snapshot(&game->server);
         apply_snapshot(&game->client, &snap);
+
+        board_effect_allocator.arena = arena_alloc(MB(4), KB(1));
 
         game->initialized = true;
     }
